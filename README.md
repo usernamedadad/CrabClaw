@@ -170,11 +170,12 @@ SERPAPI_API=
 
 ## 🙏致谢
 
-- FastAPI
-- LangChain
-- Vue 3
-- Vite
-- Ant Design Vue
+- [LangChain](https://www.langchain.com/) - Agent 编排框架
+- [FastAPI](https://fastapi.tiangolo.com/) - 后端框架
+- [Vue.js](https://vuejs.org/) - 前端框架
+- [Vite](https://vitejs.dev/) - 前端构建工具
+- [Ant Design Vue](https://antdv.com/) - UI 组件库
+
 
 ## License
 
