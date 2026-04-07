@@ -1,0 +1,42 @@
+{
+  "llm": {
+    "model_id": "",
+    "api_key": "",
+    "base_url": "",
+    "temperature": 0.4
+  },
+  "agent": {
+    "personality": "steady"
+  },
+  "tools": {
+    "serpapi_api": ""
+  },
+  "execution": {
+    "enabled": true,
+    "allowed_dirs": [],
+    "allowed_commands": [
+      "python",
+      "pip",
+      "node",
+      "npm",
+      "npx",
+      "git",
+      "soffice",
+      "pdftoppm"
+    ],
+    "blocked_terms": [
+      "shutdown",
+      "diskpart",
+      "format ",
+      "reg delete",
+      "rd /s /q",
+      "del /f /s /q",
+      "remove-item -recurse",
+      "remove-item -force",
+      "rm -rf /"
+    ],
+    "default_timeout_seconds": 90,
+    "max_timeout_seconds": 240,
+    "max_output_chars": 12000
+  }
+}
