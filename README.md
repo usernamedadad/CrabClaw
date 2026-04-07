@@ -127,6 +127,16 @@ CORS_ORIGINS=http://localhost:725
 WORKSPACE_PATH=~/.crabclaw/workspace
 SERPAPI_API=
 ```
+## 🔐安全机制
+
+```text
+1) 命令白名单：只允许授权命令执行
+2) 目录白名单：只允许在授权目录读写与执行
+3) 风险词拦截：自动拦截高危命令片段
+4) 管道/重定向拦截：默认禁用 | && > 等组合
+5) 超时与输出限制：防止长时间占用与超长输出
+6) 执行审计日志：记录 execution_audit.log 便于追踪
+```
 
 ## API接口
 
@@ -148,16 +158,7 @@ SERPAPI_API=
 | `/api/skills/install/url` | POST | URL 安装技能 |
 | `/api/skills/{skill_id}` | DELETE | 卸载技能 |
 
-## 🔐安全机制
 
-```text
-1) 命令白名单：只允许授权命令执行
-2) 目录白名单：只允许在授权目录读写与执行
-3) 风险词拦截：自动拦截高危命令片段
-4) 管道/重定向拦截：默认禁用 | && > 等组合
-5) 超时与输出限制：防止长时间占用与超长输出
-6) 执行审计日志：记录 execution_audit.log 便于追踪
-```
 
 ## 📌未来规划
 
