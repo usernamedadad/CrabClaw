@@ -45,11 +45,209 @@ class CrabClawAgent:
         self._current_session_id: Optional[str] = None
 
     def _read_identity_name(self) -> Optional[str]:
-        return extract_identity_name(self.workspace.load_config("PROFILE"))
+        return extract_identity_name(self.workspace.load_config("IDENTITY")) or extract_identity_name(
+            self.workspace.load_config("PROFILE")
+        )
 
     @staticmethod
     def _clean_value(value: str, limit: int) -> str:
         return re.sub(r"\s+", " ", (value or "")).strip()[:limit]
+
+    def _resolve_output_language(self, text: str) -> str:
+        preferred = str(self.workspace.get_user_profile(allow_fallback=True).get("输出语言") or "").strip().lower()
+        if preferred in {"english", "en"}:
+            return "en"
+        if preferred in {"中文", "zh", "cn"}:
+            return "zh"
+        if preferred == "auto":
+            return self._detect_language(text)
+        return self._detect_language(text)
+
+    @staticmethod
+    def _detect_language(text: str) -> str:
+        content = text or ""
+        cjk = len(re.findall(r"[\u4e00-\u9fff]", content))
+        latin = len(re.findall(r"[A-Za-z]", content))
+        total = cjk + latin
+        if total == 0:
+            return "zh"
+        ratio = cjk / total
+        if ratio >= 0.6:
+            return "zh"
+        if ratio <= 0.4:
+            return "en"
+        return "zh"
+
+    def _extract_onboarding_fields(self, text: str) -> tuple[dict, List[str]]:
+        content = (text or "").strip()
+        if not content:
+            return {}, []
+
+        fields: dict[str, str] = {}
+        snippets: List[str] = []
+
+        name_patterns = [
+            r"(?:^|\n)\s*(?:称呼|称呼我|名字|我的名字|我叫)\s*[：:]\s*([^\n，。,。!?！？]{1,24})",
+            r"(?:叫我|称呼我|我的名字是|我叫)\s*([^\s，。,。!?！？]{1,24})",
+        ]
+        for pattern in name_patterns:
+            matched = re.search(pattern, content, re.IGNORECASE)
+            if matched:
+                value = self._clean_value(matched.group(1), 24)
+                if value:
+                    fields["称呼"] = value
+                    snippets.append(matched.group(0))
+                break
+
+        goal_patterns = [
+            r"(?:^|\n)\s*(?:协作目标|长期目标|主要目标|希望你长期帮我)\s*[：:]\s*([^\n]{4,180})",
+            r"(?:最希望你长期帮我|长期想让你帮我)\s*([^。！？!\n]{4,180})",
+        ]
+        for pattern in goal_patterns:
+            matched = re.search(pattern, content, re.IGNORECASE)
+            if matched:
+                value = self._clean_value(matched.group(1), 180)
+                if value:
+                    fields["长期目标"] = value
+                    snippets.append(matched.group(0))
+                break
+
+        lang_match = re.search(r"(?:输出语言|用语言|语言偏好)\s*[：:]\s*(中文|English|英文|auto)", content, re.IGNORECASE)
+        if lang_match:
+            lang = lang_match.group(1).lower()
+            fields["输出语言"] = "English" if lang in {"english", "英文"} else "中文" if lang == "中文" else "auto"
+            snippets.append(lang_match.group(0))
+        elif re.search(r"(用中文回复|中文回答)", content):
+            fields["输出语言"] = "中文"
+            snippets.append("用中文回复")
+        elif re.search(r"(用英文回复|用英语回复|英文回答)", content, re.IGNORECASE):
+            fields["输出语言"] = "English"
+            snippets.append("用英文回复")
+
+        length_match = re.search(r"(?:回答长度|回复长度)\s*[：:]\s*(短|中|长)", content)
+        if length_match:
+            fields["回答长度"] = length_match.group(1)
+            snippets.append(length_match.group(0))
+        elif re.search(r"(简短|短一点)", content):
+            fields["回答长度"] = "短"
+        elif re.search(r"(详细|长一点|展开点)", content):
+            fields["回答长度"] = "长"
+        elif re.search(r"(适中|中等|正常长度)", content):
+            fields["回答长度"] = "中"
+
+        pace_match = re.search(r"(?:沟通节奏|节奏)\s*[：:]\s*(快|适中|慢)", content)
+        if pace_match:
+            fields["沟通节奏"] = pace_match.group(1)
+            snippets.append(pace_match.group(0))
+        elif re.search(r"(快一点|节奏快)", content):
+            fields["沟通节奏"] = "快"
+        elif re.search(r"(慢一点|节奏慢)", content):
+            fields["沟通节奏"] = "慢"
+        elif re.search(r"(适中|正常节奏)", content):
+            fields["沟通节奏"] = "适中"
+
+        tz_match = re.search(r"(?:时区)\s*[：:]\s*([A-Za-z_/]+|UTC[+-]\d{1,2}:?\d{0,2})", content)
+        if tz_match:
+            fields["时区"] = tz_match.group(1).strip()
+            snippets.append(tz_match.group(0))
+
+        return fields, snippets
+
+    @staticmethod
+    def _should_skip_onboarding(text: str) -> bool:
+        return bool(re.search(r"(先不填|暂时不填|不想填|不填写|以后再说|先别问)", text or ""))
+
+    @staticmethod
+    def _build_onboarding_question(field: str, language: str) -> str:
+        if language == "en":
+            prompts = {
+                "称呼": "How should I address you?",
+                "长期目标": "What long-term goal should I focus on for you?",
+                "输出语言": "Preferred output language? (中文 / English / auto)",
+                "回答长度": "Preferred answer length? (短 / 中 / 长)",
+                "沟通节奏": "Preferred pacing? (快 / 适中 / 慢)",
+            }
+        else:
+            prompts = {
+                "称呼": "你希望我怎么称呼你？",
+                "长期目标": "你最希望我长期重点帮你做什么？",
+                "输出语言": "输出语言偏好？可选：中文 / English / auto",
+                "回答长度": "回答长度偏好？可选：短 / 中 / 长",
+                "沟通节奏": "沟通节奏偏好？可选：快 / 适中 / 慢",
+            }
+        return prompts.get(field, "你希望我补充哪项长期协作信息？")
+
+    @staticmethod
+    def _build_profile_update_prompt(field: str, value: str, language: str) -> str:
+        if language == "en":
+            return f"Confirm updating {field} to \"{value}\"?"
+        return f"确认把{field}更新为“{value}”吗？"
+
+    @staticmethod
+    def _split_paragraphs(text: str) -> List[str]:
+        blocks: List[str] = []
+        current: List[str] = []
+        for line in (text or "").splitlines():
+            if not line.strip():
+                if current:
+                    blocks.append("\n".join(current).strip())
+                    current = []
+                continue
+            current.append(line)
+        if current:
+            blocks.append("\n".join(current).strip())
+        return blocks
+
+    @staticmethod
+    def _truncate_entries(entries: List[str], limit: int) -> List[str]:
+        if limit <= 0:
+            return []
+        kept: List[str] = []
+        total = 0
+        for entry in reversed(entries):
+            entry_len = len(entry) + (2 if kept else 0)
+            if total + entry_len > limit:
+                if not kept:
+                    kept.append(entry[:limit])
+                break
+            kept.append(entry)
+            total += entry_len
+        return list(reversed(kept))
+
+    @staticmethod
+    def _build_segment(title: str, entries: List[str], sep: str) -> str:
+        body = sep.join(entries).strip()
+        if body:
+            return f"## {title}\n{body}"
+        return f"## {title}"
+
+    @staticmethod
+    def _build_field_entries(profile: dict, fields: List[str]) -> List[str]:
+        entries: List[str] = []
+        for label in fields:
+            value = str(profile.get(label) or "").strip()
+            if value:
+                entries.append(f"- {label}：{value}")
+        return entries
+
+    @staticmethod
+    def _build_longterm_entries(text: str) -> List[str]:
+        entries: List[str] = []
+        heading = ""
+        for line in (text or "").splitlines():
+            stripped = line.strip()
+            if stripped.startswith("## "):
+                heading = stripped
+                continue
+            if stripped.startswith("- "):
+                if heading:
+                    entries.append(f"{heading}\n{stripped}")
+                else:
+                    entries.append(stripped)
+
+        if not entries and text.strip():
+            entries = [text.strip()]
+        return entries
 
     def _extract_first_contact_fields(self, text: str) -> dict:
         content = (text or "").strip()
@@ -142,35 +340,72 @@ class CrabClawAgent:
 
     def _build_system_prompt(self) -> str:
         base_prompt = (self.workspace.load_config("AGENTS") or "").strip()
-        context_blocks: list[str] = [
-            base_prompt
-            or "你是 CrabClaw，负责把用户目标变成可执行结果。优先真实、可落地、少废话。"
+        if not base_prompt:
+            base_prompt = "你是 CrabClaw，负责把用户目标变成可执行结果。优先真实、可落地、少废话。"
+
+        identity_profile = self.workspace.get_identity_profile(allow_fallback=True)
+        user_profile = self.workspace.get_user_profile(allow_fallback=True)
+        soul_profile = self.workspace.get_soul_profile(allow_fallback=True)
+        longterm_memory = (self.workspace.load_config("MERMORY") or "").strip()
+
+        segments = [
+            {
+                "key": "guide",
+                "title": "工作指南",
+                "entries": self._split_paragraphs(base_prompt) or [base_prompt],
+                "sep": "\n\n",
+            },
+            {
+                "key": "identity",
+                "title": "身份信息",
+                "entries": self._build_field_entries(identity_profile, ["名称", "角色", "风格", "表情符号", "头像"]),
+                "sep": "\n",
+            },
+            {
+                "key": "user",
+                "title": "用户信息",
+                "entries": self._build_field_entries(
+                    user_profile, ["称呼", "长期目标", "输出语言", "回答长度", "沟通节奏", "时区"]
+                ),
+                "sep": "\n",
+            },
+            {
+                "key": "soul",
+                "title": "人格模板",
+                "entries": self._build_field_entries(soul_profile, ["核心准则", "边界", "风格"]),
+                "sep": "\n",
+            },
+            {
+                "key": "memory",
+                "title": "长期记忆",
+                "entries": self._build_longterm_entries(longterm_memory) if longterm_memory else [],
+                "sep": "\n\n",
+            },
         ]
 
-        profile = self.workspace.load_config("PROFILE")
-        if profile:
-            context_blocks.append(f"## 协作档案\n{profile}")
+        per_limit = 8000
+        total_limit = 32000
+        for segment in segments:
+            segment["entries"] = self._truncate_entries(segment["entries"], per_limit)
 
-        identity_name = self._read_identity_name()
-        if identity_name:
-            context_blocks.append(f"你的名字是 {identity_name}。")
+        def build_blocks() -> List[str]:
+            return [self._build_segment(seg["title"], seg["entries"], seg["sep"]) for seg in segments]
 
-        active_context = self.workspace.load_active_context()
-        if active_context:
-            context_blocks.append(f"## 当前任务上下文\n{active_context}")
+        total_len = len("\n\n".join(build_blocks()))
+        trim_order = ["memory", "soul", "identity", "user", "guide"]
+        while total_len > total_limit:
+            trimmed = False
+            for key in trim_order:
+                target = next((seg for seg in segments if seg["key"] == key), None)
+                if target and target["entries"]:
+                    target["entries"].pop(0)
+                    trimmed = True
+                    break
+            if not trimmed:
+                break
+            total_len = len("\n\n".join(build_blocks()))
 
-        recent_days = self.workspace.get_recent_memory_day(days=2)
-        if recent_days:
-            context_blocks.append(
-                "## 补充提示\n"
-                "如果用户提到了过去几天的事，可以找相关的记忆文件参考。"
-            )
-
-        longterm_memory = self.workspace.load_config("MERMORY")
-        if longterm_memory:
-            context_blocks.append(f"## 长期记忆\n{longterm_memory}")
-
-        return "\n\n".join(context_blocks)
+        return "\n\n".join(build_blocks()).strip()
 
     def _build_tools(self):
         memory_tool = self._memory_tool
@@ -585,10 +820,7 @@ class CrabClawAgent:
         self.workspace.save_session_data(session_id, session_data)
 
     async def _capture_memories(self, user_message: str) -> None:
-        try:
-            await self._memory_capture_manager.acapture_and_store(user_message)
-        except Exception:
-            return
+        return
 
     def _estimate_tokens(self, messages: List[dict]) -> int:
         chars = len(self._build_system_prompt())
@@ -625,16 +857,65 @@ class CrabClawAgent:
         data = self.workspace.load_session_data(sid)
         history = data.get("messages", [])
 
-        # first_contact_reply = self._handle_first_contact_gate(normalized_message)
-        # if first_contact_reply:
-        #     self._append_and_save_history(
-        #         sid,
-        #         history,
-        #         message,
-        #         [{"role": "assistant", "content": first_contact_reply}],
-        #     )
-        #     self._memory_capture_manager.capture_and_store(normalized_message)
-        #     return first_contact_reply, sid
+        language = self._resolve_output_language(normalized_message)
+        timezone_name = self.workspace.get_user_timezone()
+        pending_before = self._memory_capture_manager.get_pending(sid)
+        pending_block_onboarding = bool(pending_before)
+        confirm_prompt: Optional[str] = None
+
+        if pending_before:
+            pending_result = self._memory_capture_manager.resolve_pending(sid, normalized_message, language)
+            status = pending_result.get("status")
+            if status == "confirmed":
+                pending = pending_result.get("pending") or {}
+                pending_type = pending.get("type")
+                if pending_type == "memory":
+                    self._memory_capture_manager.store_confirmed_memory(pending, timezone_name=timezone_name)
+                elif pending_type == "promote_longterm":
+                    self._memory_capture_manager.promote_longterm(pending)
+                elif pending_type == "profile_update":
+                    self.workspace.update_user_profile(pending.get("updates", {}))
+            elif status == "pending":
+                confirm_prompt = (pending_result.get("pending") or {}).get("confirm_prompt")
+
+        onboarding_fields, onboarding_snippets = self._extract_onboarding_fields(normalized_message)
+        profile_updates: dict[str, str] = {}
+        profile_conflict: tuple[str, str] | None = None
+        if onboarding_fields:
+            current_profile = self.workspace.get_user_profile(allow_fallback=False)
+            for field, value in onboarding_fields.items():
+                current = str(current_profile.get(field) or "").strip()
+                if current and value and current != value:
+                    profile_conflict = (field, value)
+                    break
+                if value and value != current:
+                    profile_updates[field] = value
+
+        if profile_updates:
+            self.workspace.update_user_profile(profile_updates)
+
+        if profile_conflict and not pending_block_onboarding and not confirm_prompt:
+            field, value = profile_conflict
+            prompt = self._build_profile_update_prompt(field, value, language)
+            self._memory_capture_manager.set_pending(
+                sid,
+                {
+                    "type": "profile_update",
+                    "updates": {field: value},
+                    "confirm_prompt": prompt,
+                    "turns_waited": 0,
+                },
+            )
+            confirm_prompt = prompt
+            pending_block_onboarding = True
+
+        onboarding_question: Optional[str] = None
+        if not pending_block_onboarding and not confirm_prompt and not self._should_skip_onboarding(normalized_message):
+            profile = self.workspace.get_user_profile(allow_fallback=False)
+            for field in ["称呼", "长期目标", "输出语言", "回答长度", "沟通节奏"]:
+                if not profile.get(field):
+                    onboarding_question = self._build_onboarding_question(field, language)
+                    break
 
         self._ensure_agent()
         base_messages = self._history_to_langchain_messages(history)
@@ -661,9 +942,33 @@ class CrabClawAgent:
         if final_text and not any(m.get("role") == "assistant" and m.get("content") for m in generated):
             generated.append({"role": "assistant", "content": final_text})
 
+        allow_new_candidates = not pending_block_onboarding and not confirm_prompt
+        allow_explicit_only = pending_block_onboarding or bool(confirm_prompt)
+        allow_confirm_prompts = confirm_prompt is None
+        capture_result = self._memory_capture_manager.capture_and_store(
+            normalized_message,
+            session_id=sid,
+            language=language,
+            allow_new_candidates=allow_new_candidates,
+            allow_explicit_only=allow_explicit_only,
+            allow_confirm_prompts=allow_confirm_prompts,
+            skip_phrases=onboarding_snippets,
+            timezone_name=timezone_name,
+        )
+        if not confirm_prompt and capture_result.get("confirm_prompt"):
+            confirm_prompt = capture_result.get("confirm_prompt")
+
+        followup = confirm_prompt or onboarding_question
+        if followup:
+            final_text = (final_text or "").rstrip()
+            final_text = f"{final_text}\n\n{followup}".strip()
+            if not any(m.get("role") == "assistant" and m.get("content") for m in generated):
+                generated.append({"role": "assistant", "content": final_text})
+            else:
+                generated[-1]["content"] = final_text
+
         self._append_and_save_history(sid, history, message, generated)
         self._run_memory_flush_if_needed(output_messages, sid)
-        self._memory_capture_manager.capture_and_store(normalized_message)
 
         return final_text, sid
 
@@ -693,30 +998,65 @@ class CrabClawAgent:
             yield {"event": "error", "data": {"error": str(exc)}}
             return
 
-        # first_contact_reply = self._handle_first_contact_gate(normalized_message)
-        # if first_contact_reply:
-        #     self._append_and_save_history(
-        #         sid,
-        #         history,
-        #         message,
-        #         [{"role": "assistant", "content": first_contact_reply}],
-        #     )
-        #     await self._capture_memories(normalized_message)
-        #     yield {
-        #         "event": "session",
-        #         "data": {
-        #             "session_id": sid,
-        #         },
-        #     }
-        #     yield {"event": "chunk", "data": {"content": first_contact_reply}}
-        #     yield {
-        #         "event": "done",
-        #         "data": {
-        #             "content": first_contact_reply,
-        #             "session_id": sid,
-        #         },
-        #     }
-        #     return
+        language = self._resolve_output_language(normalized_message)
+        timezone_name = self.workspace.get_user_timezone()
+        pending_before = self._memory_capture_manager.get_pending(sid)
+        pending_block_onboarding = bool(pending_before)
+        confirm_prompt: Optional[str] = None
+
+        if pending_before:
+            pending_result = self._memory_capture_manager.resolve_pending(sid, normalized_message, language)
+            status = pending_result.get("status")
+            if status == "confirmed":
+                pending = pending_result.get("pending") or {}
+                pending_type = pending.get("type")
+                if pending_type == "memory":
+                    self._memory_capture_manager.store_confirmed_memory(pending, timezone_name=timezone_name)
+                elif pending_type == "promote_longterm":
+                    self._memory_capture_manager.promote_longterm(pending)
+                elif pending_type == "profile_update":
+                    self.workspace.update_user_profile(pending.get("updates", {}))
+            elif status == "pending":
+                confirm_prompt = (pending_result.get("pending") or {}).get("confirm_prompt")
+
+        onboarding_fields, onboarding_snippets = self._extract_onboarding_fields(normalized_message)
+        profile_updates: dict[str, str] = {}
+        profile_conflict: tuple[str, str] | None = None
+        if onboarding_fields:
+            current_profile = self.workspace.get_user_profile(allow_fallback=False)
+            for field, value in onboarding_fields.items():
+                current = str(current_profile.get(field) or "").strip()
+                if current and value and current != value:
+                    profile_conflict = (field, value)
+                    break
+                if value and value != current:
+                    profile_updates[field] = value
+
+        if profile_updates:
+            self.workspace.update_user_profile(profile_updates)
+
+        if profile_conflict and not pending_block_onboarding and not confirm_prompt:
+            field, value = profile_conflict
+            prompt = self._build_profile_update_prompt(field, value, language)
+            self._memory_capture_manager.set_pending(
+                sid,
+                {
+                    "type": "profile_update",
+                    "updates": {field: value},
+                    "confirm_prompt": prompt,
+                    "turns_waited": 0,
+                },
+            )
+            confirm_prompt = prompt
+            pending_block_onboarding = True
+
+        onboarding_question: Optional[str] = None
+        if not pending_block_onboarding and not confirm_prompt and not self._should_skip_onboarding(normalized_message):
+            profile = self.workspace.get_user_profile(allow_fallback=False)
+            for field in ["称呼", "长期目标", "输出语言", "回答长度", "沟通节奏"]:
+                if not profile.get(field):
+                    onboarding_question = self._build_onboarding_question(field, language)
+                    break
 
         try:
             self._ensure_agent()
@@ -794,9 +1134,38 @@ class CrabClawAgent:
             if full_text and not any(m.get("role") == "assistant" and m.get("content") for m in generated):
                 generated.append({"role": "assistant", "content": full_text})
 
+            allow_new_candidates = not pending_block_onboarding and not confirm_prompt
+            allow_explicit_only = pending_block_onboarding or bool(confirm_prompt)
+            allow_confirm_prompts = confirm_prompt is None
+            capture_result = self._memory_capture_manager.capture_and_store(
+                normalized_message,
+                session_id=sid,
+                language=language,
+                allow_new_candidates=allow_new_candidates,
+                allow_explicit_only=allow_explicit_only,
+                allow_confirm_prompts=allow_confirm_prompts,
+                skip_phrases=onboarding_snippets,
+                timezone_name=timezone_name,
+            )
+            if not confirm_prompt and capture_result.get("confirm_prompt"):
+                confirm_prompt = capture_result.get("confirm_prompt")
+
+            followup = confirm_prompt or onboarding_question
+            if followup:
+                if (full_text or "").strip():
+                    extra = f"\n\n{followup}"
+                    full_text = (full_text or "").rstrip() + extra
+                else:
+                    extra = followup
+                    full_text = followup
+                yield {"event": "chunk", "data": {"content": extra}}
+                if not any(m.get("role") == "assistant" and m.get("content") for m in generated):
+                    generated.append({"role": "assistant", "content": full_text})
+                else:
+                    generated[-1]["content"] = full_text
+
             self._append_and_save_history(sid, history, message, generated)
             self._run_memory_flush_if_needed(final_messages or input_messages, sid)
-            await self._capture_memories(normalized_message)
 
             yield {
                 "event": "done",

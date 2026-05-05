@@ -19,14 +19,16 @@ CONFIG_FILES = [
     "AGENTS",
     "PROFILE",
     "MERMORY",
+    "IDENTITY",
+    "USER",
+    "SOUL",
+    "BOOTSTRAP",
+    "HEARTBEAT",
 ]
 
 CONFIG_ALIASES = {
-    "BOOTSTRAP": "AGENTS",
     "KICKOFF": "AGENTS",
     "PRINCIPLES": "AGENTS",
-    "SOUL": "AGENTS",
-    "IDENTITY": "PROFILE",
     "MEMORY": "MERMORY",
     "KNOWLEDGE": "MERMORY",
 }
@@ -48,6 +50,11 @@ LONGTERM_SECTION_ALIASES = {
     "决策": ["决策", "决策（Decisions）", "Decisions"],
     "用户身份": ["用户身份", "身份", "Identity"],
 }
+
+IDENTITY_FIELDS = ["名称", "角色", "风格", "表情符号", "头像"]
+USER_FIELDS = ["称呼", "长期目标", "输出语言", "回答长度", "沟通节奏", "时区"]
+USER_REQUIRED_FIELDS = ["称呼", "长期目标", "输出语言", "回答长度", "沟通节奏"]
+SOUL_FIELDS = ["核心准则", "边界", "风格"]
 
 TEMPLATES_DIR = Path(__file__).parent / "presets"
 
@@ -83,6 +90,23 @@ def extract_identity_name(identity_text: str | None) -> str | None:
             if name and not name.startswith("_"):
                 return name
     return None
+
+
+def _extract_field_value(text: str | None, label: str) -> str:
+    if not text:
+        return ""
+
+    pattern = re.compile(
+        rf"^\s*[-*]?\s*(?:\*\*)?{re.escape(label)}[：:](?:\*\*)?\s*(.*)$"
+    )
+    for line in text.splitlines():
+        matched = pattern.match(line.strip())
+        if not matched:
+            continue
+        value = (matched.group(1) or "").strip()
+        if value and not value.startswith("_"):
+            return value
+    return ""
 
 
 def get_default_global_config() -> dict:
@@ -293,13 +317,28 @@ class WorkspaceManager:
         with path.open("a", encoding="utf-8") as f:
             f.write(f"\n## {stamp}\n\n{content}\n")
 
-    def append_classified_memory(self, content: str, category: str, date: datetime | None = None) -> None:
+    @staticmethod
+    def _format_memory_tags(category: str, tags: Optional[List[str]] = None) -> str:
+        normalized_category = (category or "fact").strip().lower()
+        extra = [t.strip().lower() for t in (tags or []) if t and t.strip()]
+        allowed = ["confirmed", "explicit", "sensitive"]
+        ordered = [normalized_category] + [t for t in allowed if t in extra]
+        return "".join(f"[{item}]" for item in ordered)
+
+    def append_classified_memory(
+        self,
+        content: str,
+        category: str,
+        date: datetime | None = None,
+        tags: Optional[List[str]] = None,
+    ) -> None:
         path = self.get_daily_memory_path(date)
         stamp = datetime.now().strftime("%H:%M")
         if not path.exists():
             path.write_text(f"# {path.stem}\n", encoding="utf-8")
+        tag_text = self._format_memory_tags(category, tags)
         with path.open("a", encoding="utf-8") as f:
-            f.write(f"\n## {stamp} - auto-capture\n\n- [{category}] {content}\n")
+            f.write(f"\n## {stamp} - auto-capture\n\n- {tag_text} {content}\n")
 
     def _append_bullet_to_longterm_section(self, markdown: str, section: str, bullet: str) -> str:
         lines = markdown.splitlines()
@@ -362,56 +401,102 @@ class WorkspaceManager:
         self.save_config(LONGTERM_CONFIG_NAME, updated)
 
     @staticmethod
+    def _extract_fields(text: str | None, labels: List[str]) -> dict:
+        return {label: _extract_field_value(text, label) for label in labels}
+
+    def _extract_profile_fields(self, labels: List[str]) -> dict:
+        profile_text = self.load_config("PROFILE") or ""
+        return self._extract_fields(profile_text, labels)
+
+    @staticmethod
+    def _merge_fields(primary: dict, fallback: dict) -> dict:
+        merged = dict(primary)
+        for key, value in fallback.items():
+            if not merged.get(key) and value:
+                merged[key] = value
+        return merged
+
+    @staticmethod
     def _normalize_onboarding_text(value: str | None, max_len: int = 120) -> str:
         text = re.sub(r"\s+", " ", str(value or "")).strip()
         return text[:max_len]
 
     def get_onboarding_profile(self) -> dict:
-        profile = {
-            "display_name": "",
-            "goal": "",
-        }
-
-        text = self.load_config(LONGTERM_CONFIG_NAME) or ""
-        if not text.strip():
-            return profile
-
-        for line in text.splitlines():
-            normalized = line.strip().lstrip("- ").strip()
-            if not normalized:
-                continue
-
-            name_match = re.search(r"(?:用户称呼|称呼|我的称呼|姓名|名字|用户身份)[：:]\s*(.+)$", normalized, re.IGNORECASE)
-            if name_match:
-                profile["display_name"] = self._normalize_onboarding_text(name_match.group(1), max_len=32)
-                continue
-
-            goal_match = re.search(r"(?:协作目标|主要诉求|希望助手帮忙|希望助手帮助|希望你帮我|当前主线)[：:]\s*(.+)$", normalized, re.IGNORECASE)
-            if goal_match:
-                profile["goal"] = self._normalize_onboarding_text(goal_match.group(1), max_len=180)
-                continue
-
-        return profile
+        return self.get_user_profile(allow_fallback=False)
 
     def has_completed_first_contact(self) -> bool:
-        profile = self.get_onboarding_profile()
-        return bool(profile.get("display_name") and profile.get("goal"))
+        profile = self.get_user_profile(allow_fallback=False)
+        return all(profile.get(field) for field in USER_REQUIRED_FIELDS)
 
     def save_first_contact_profile(
         self,
         display_name: str | None = None,
         goal: str | None = None,
     ) -> dict:
-        clean_name = self._normalize_onboarding_text(display_name, max_len=32)
-        clean_goal = self._normalize_onboarding_text(goal, max_len=180)
+        updates = {}
+        if display_name:
+            updates["称呼"] = self._normalize_onboarding_text(display_name, max_len=32)
+        if goal:
+            updates["长期目标"] = self._normalize_onboarding_text(goal, max_len=180)
+        if updates:
+            self.update_user_profile(updates)
+        return self.get_user_profile(allow_fallback=False)
 
-        if clean_name:
-            self.append_to_longterm_memory(f"用户称呼：{clean_name}", "entity")
+    def get_identity_profile(self, allow_fallback: bool = True) -> dict:
+        identity_text = self.load_config("IDENTITY") or ""
+        fields = self._extract_fields(identity_text, IDENTITY_FIELDS)
+        if not allow_fallback:
+            return fields
+        fallback = self._extract_profile_fields(["名称", "角色", "风格"])
+        return self._merge_fields(fields, fallback)
 
-        if clean_goal:
-            self.append_to_longterm_memory(f"协作目标：{clean_goal}", "fact")
+    def get_user_profile(self, allow_fallback: bool = True) -> dict:
+        user_text = self.load_config("USER") or ""
+        fields = self._extract_fields(user_text, USER_FIELDS)
+        if not allow_fallback:
+            return fields
+        fallback = self._extract_profile_fields(USER_FIELDS)
+        return self._merge_fields(fields, fallback)
 
-        return self.get_onboarding_profile()
+    def get_soul_profile(self, allow_fallback: bool = True) -> dict:
+        soul_text = self.load_config("SOUL") or ""
+        fields = self._extract_fields(soul_text, SOUL_FIELDS)
+        if not allow_fallback:
+            return fields
+        fallback = self._extract_profile_fields(SOUL_FIELDS)
+        return self._merge_fields(fields, fallback)
+
+    def update_user_profile(self, updates: dict) -> dict:
+        if not updates:
+            return self.get_user_profile(allow_fallback=False)
+
+        content = self.load_config("USER") or self._render_config_template("USER")
+        lines = content.splitlines()
+
+        for label, raw_value in updates.items():
+            if label not in USER_FIELDS:
+                continue
+            value = self._normalize_onboarding_text(raw_value, max_len=180)
+            if not value:
+                continue
+
+            replaced = False
+            pattern = re.compile(
+                rf"^\s*[-*]?\s*(?:\*\*)?{re.escape(label)}[：:](?:\*\*)?\s*.*$"
+            )
+            for idx, line in enumerate(lines):
+                if pattern.match(line.strip()):
+                    prefix = "- " if line.lstrip().startswith("-") else ""
+                    lines[idx] = f"{prefix}**{label}：** {value}".rstrip()
+                    replaced = True
+                    break
+
+            if not replaced:
+                lines.append(f"- **{label}：** {value}")
+
+        updated = "\n".join(lines).rstrip() + "\n"
+        self.save_config("USER", updated)
+        return self.get_user_profile(allow_fallback=False)
 
     def list_memory_files(self) -> List[dict]:
         files: List[dict] = []
@@ -650,6 +735,41 @@ class WorkspaceManager:
             if self._calculate_overlap(keywords, text) >= threshold:
                 return True
 
+        return False
+
+    def get_user_timezone(self) -> str:
+        profile = self.get_user_profile(allow_fallback=True)
+        return str(profile.get("时区") or "").strip()
+
+    def has_cross_day_repeat(
+        self,
+        content: str,
+        threshold: float = 0.7,
+        days: int = 7,
+        today_date: datetime | None = None,
+    ) -> bool:
+        keywords = self._extract_keywords(content)
+        if not keywords:
+            return False
+
+        today = today_date.date() if today_date else datetime.now().date()
+        for path in self.memory_path.glob("*.md"):
+            if not self._is_daily_memory_filename(path.name):
+                continue
+            try:
+                file_date = datetime.strptime(path.stem, "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            if file_date == today:
+                continue
+            if abs((today - file_date).days) > days:
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+            except Exception:
+                continue
+            if self._calculate_overlap(keywords, text) >= threshold:
+                return True
         return False
 
     def get_recent_memory_day(self, days: int = 2) -> List[str]:
