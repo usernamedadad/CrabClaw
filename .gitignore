@@ -58,8 +58,16 @@ Thumbs.db
 .crabclaw/
 execution_audit.log
 
+# Claude Code
+.claude/
+CLAUDE.md
+
 # Plan documents
 plan-*.prompt.md
+# Temp / scratch files
+tmp/
+temp/
+*.tmp
 
 # Superpowers specs (do not commit)
 docs/superpowers/specs/

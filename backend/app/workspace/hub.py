@@ -7,7 +7,10 @@ import os
 import re
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..memory.embeddings import EmbeddingIndex
 
 try:
     from rank_bm25 import BM25Okapi
@@ -136,10 +139,31 @@ class WorkspaceManager:
         self.memory_path = self.workspace_path / "memory"
         self.sessions_path = self.workspace_path / "sessions"
         self.skills_path = self.workspace_path / "skills"
+        self._embeddings_path = self.memory_path / ".embeddings"
+        self._embedding_index: Optional["EmbeddingIndex"] = None
+        self._memory_content_hash = ""
 
     @property
     def global_config_path(self) -> Path:
         return self.root_path / "config.json"
+
+    def _get_embedding_index(self) -> Optional["EmbeddingIndex"]:
+        if self._embedding_index is not None:
+            return self._embedding_index
+        llm_cfg = self.get_llm_config()
+        api_key = llm_cfg.get("api_key", "")
+        base_url = llm_cfg.get("base_url", "")
+        if not api_key:
+            return None
+        from ..memory.embeddings import EmbeddingIndex
+        self._embeddings_path.mkdir(parents=True, exist_ok=True)
+        self._embedding_index = EmbeddingIndex(
+            storage_dir=self._embeddings_path,
+            api_key=api_key,
+            base_url=base_url,
+        )
+        self._embedding_index.load_index()
+        return self._embedding_index
 
     def ensure_workspace_exists(self) -> None:
         self.root_path.mkdir(parents=True, exist_ok=True)
@@ -155,7 +179,10 @@ class WorkspaceManager:
 
         if not self.global_config_path.exists():
             self.save_global_config(get_default_global_config())
-        
+
+        # 首次初始化时复制预置技能到 workspace/skills/
+        self._install_preset_skills()
+
         # 把 .env 里的值同步到 config.json 里（如果 config.json 里的对应值为空）
         data = self.load_global_config()
         if not isinstance(data, dict):
@@ -271,6 +298,19 @@ class WorkspaceManager:
     def get_search_api_key(self) -> str:
         cfg = self.load_global_config().get("tools", {})
         return cfg.get("serpapi_api") or os.getenv("SERPAPI_API", "")
+
+    def _install_preset_skills(self) -> None:
+        presets_dir = TEMPLATES_DIR.parent / "presets" / "skills"
+        if not presets_dir.exists():
+            return
+        for skill_dir in presets_dir.iterdir():
+            if not skill_dir.is_dir():
+                continue
+            target = self.skills_path / skill_dir.name
+            if target.exists():
+                continue
+            import shutil
+            shutil.copytree(str(skill_dir), str(target))
 
     def _create_default_config(self, name: str) -> None:
         content = self._render_config_template(name)
@@ -656,7 +696,80 @@ class WorkspaceManager:
 
             results.extend(merged_by_source.values())
 
+        # Semantic search via embedding index (hybrid ranking)
+        eidx = self._get_embedding_index()
+        if eidx is not None:
+            try:
+                self._index_memory_for_semantic(eidx)
+                semantic_hits = eidx.search(keyword, top_k=5)
+                seen = {r["source"] for r in results}
+                for hit in semantic_hits:
+                    eid = hit["id"]
+                    source, _, line_part = eid.partition("::L")
+                    if source in seen:
+                        continue
+                    seen.add(source)
+                    try:
+                        line_idx = int(line_part) - 1
+                    except ValueError:
+                        line_idx = 0
+                    content = self.load_memory_file(source.replace("memory/", ""))
+                    if content:
+                        lines_list = content.splitlines()
+                        start = max(0, line_idx - context_lines)
+                        end = min(len(lines_list), line_idx + context_lines + 1)
+                        block = "\n".join(
+                            f"{no+1:4d} | {lines_list[no]}" for no in range(start, end)
+                        )
+                        results.append({
+                            "source": source,
+                            "matches": [{
+                                "start_line": start + 1,
+                                "end_line": end,
+                                "content": block,
+                            }],
+                        })
+            except Exception:
+                pass
+
         return results
+
+    def _index_memory_for_semantic(self, eidx: "EmbeddingIndex") -> None:
+        """Lazily index memory entries for semantic search (skips if unchanged)."""
+        import hashlib
+        entries: list[dict] = []
+        sources = (
+            [(self.get_config_path("MERMORY"), "MERMORY.md")]
+            + [
+                (p, f"memory/{p.name}")
+                for p in sorted(self.memory_path.glob("*.md"))
+                if re.fullmatch(r"\d{4}-\d{2}-\d{2}\.md", p.name)
+            ]
+        )
+        hasher = hashlib.md5()
+        for path, source_name in sources:
+            if not path.exists():
+                continue
+            try:
+                content = path.read_text(encoding="utf-8")
+                hasher.update(content.encode())
+                for idx, line in enumerate(content.splitlines()):
+                    stripped = line.strip()
+                    if not stripped or stripped.startswith("#"):
+                        continue
+                    entries.append({
+                        "id": f"{source_name}::L{idx + 1}",
+                        "text": stripped,
+                    })
+            except OSError:
+                continue
+        new_hash = hasher.hexdigest()
+        if new_hash == self._memory_content_hash:
+            return
+        self._memory_content_hash = new_hash
+        if entries:
+            eidx._invalidate_cache()
+            eidx.index_entries(entries)
 
     def _tokenize(self, text: str) -> list[str]:
         text = text.lower().strip()

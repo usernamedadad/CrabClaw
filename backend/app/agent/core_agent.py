@@ -17,8 +17,9 @@ from langchain_openai import ChatOpenAI
 from ..memory.chat_recap import SessionSummarizer
 from ..memory.context_guard import MemoryFlushManager
 from ..memory.signal_capture import MemoryCaptureManager
+from ..rag import RagIngester, RagRetriever
 from ..skills import SkillRegistry
-from ..tools import ExecuteCommandTool, MemoryTool, WebFetchTool, WebSearchTool, WorkspaceFileTool
+from ..tools import CalculatorTool, DateTimeTool, ExecuteCommandTool, MemoryTool, WebFetchTool, WebSearchTool, WorkspaceFileTool
 from ..workspace.hub import WorkspaceManager, extract_identity_name
 from .stream_bridge import extract_text_chunk, find_final_assistant_text, message_to_history
 
@@ -34,10 +35,15 @@ class CrabClawAgent:
         self._web_fetch_tool = WebFetchTool()
         self._execute_command_tool = ExecuteCommandTool(self.workspace)
         self._workspace_file_tool = WorkspaceFileTool(self.workspace)
+        self._datetime_tool = DateTimeTool()
+        self._calculator_tool = CalculatorTool()
 
         self._memory_capture_manager = MemoryCaptureManager(self.workspace)
         self._memory_flush_manager = MemoryFlushManager()
         self._skill_registry = SkillRegistry(self.workspace)
+        self._rag_dir = self.workspace.workspace_path.parent / "rag"
+        self._rag_index_dir = self._rag_dir / "index"
+        self._rag_docs_dir = self._rag_dir / "docs"
 
         self._agent = None
         self._runtime_snapshot: Optional[tuple[Any, ...]] = None
@@ -507,6 +513,50 @@ class CrabClawAgent:
                 lines.append(f"- {skill['name']}: {skill['description']}")
             return "\n".join(lines)
 
+        @tool("datetime_query")
+        def datetime_query(query: str = "") -> str:
+            """查询当前日期、时间和星期。"""
+            return self._datetime_tool.run(query)
+
+        @tool("calculator")
+        def calculator(expression: str) -> str:
+            """安全计算数学表达式，支持加减乘除、幂运算、三角函数等。"""
+            return self._calculator_tool.run(expression)
+
+        @tool("rag_search")
+        def rag_search(query: str, top_k: int = 5) -> str:
+            """搜索已索引的文档，返回语义相关的内容片段。使用前需先通过 rag_ingest 索引文档。"""
+            eidx = self.workspace._get_embedding_index()
+            if eidx is None:
+                return "RAG 不可用：请先配置 LLM API key（embedding 需要）。"
+            retriever = RagRetriever(self._rag_index_dir, eidx)
+            return retriever.search(query, top_k=top_k)
+
+        @tool("rag_list")
+        def rag_list() -> str:
+            """列出所有已索引的文档。"""
+            eidx = self.workspace._get_embedding_index()
+            if eidx is None:
+                return "RAG 不可用：请先配置 LLM API key。"
+            ingester = RagIngester(self._rag_index_dir, eidx)
+            docs = ingester.list_docs()
+            if not docs:
+                return "当前没有已索引的文档。使用 rag_ingest 上传文档。"
+            lines = ["已索引的文档："]
+            for d in docs:
+                lines.append(f"- {d['doc_id']}：{d.get('source', '?')} ({d.get('chunks', 0)} 块)")
+            return "\n".join(lines)
+
+        @tool("rag_delete")
+        def rag_delete(doc_id: str) -> str:
+            """删除已索引的文档，传入文档 ID（通过 rag_list 查看）。"""
+            eidx = self.workspace._get_embedding_index()
+            if eidx is None:
+                return "RAG 不可用。"
+            ingester = RagIngester(self._rag_index_dir, eidx)
+            ok = ingester.delete_doc(doc_id)
+            return f"已删除文档 {doc_id}" if ok else f"文档 {doc_id} 不存在"
+
         return [
             memory_search,
             memory_get,
@@ -524,6 +574,11 @@ class CrabClawAgent:
             write_workspace_file,
             execute_command,
             list_skills,
+            datetime_query,
+            calculator,
+            rag_search,
+            rag_list,
+            rag_delete,
         ]
 
     def _rebuild_agent_if_needed(self) -> None:
@@ -819,9 +874,6 @@ class CrabClawAgent:
         session_data["messages"] = merged
         self.workspace.save_session_data(session_id, session_data)
 
-    async def _capture_memories(self, user_message: str) -> None:
-        return
-
     def _estimate_tokens(self, messages: List[dict]) -> int:
         chars = len(self._build_system_prompt())
         for msg in messages:
@@ -850,9 +902,14 @@ class CrabClawAgent:
             return
 
     def chat(self, message: str, session_id: str | None = None, skill_id: str | None = None) -> tuple[str, str]:
-        normalized_message, selected_skill = self._resolve_skill_mode(message, skill_id)
         sid = session_id or self.create_session()
         self._current_session_id = sid
+
+        first_contact_response = self._handle_first_contact_gate(message)
+        if first_contact_response is not None:
+            return first_contact_response, sid
+
+        normalized_message, selected_skill = self._resolve_skill_mode(message, skill_id)
 
         data = self.workspace.load_session_data(sid)
         history = data.get("messages", [])
@@ -925,9 +982,15 @@ class CrabClawAgent:
         input_messages.append(HumanMessage(content=normalized_message))
         runtime_config = self._runtime_config(sid)
 
-        result = self._agent.invoke({"messages": input_messages}, config=runtime_config, version="v2")
-        state = result.value if hasattr(result, "value") else result
-        output_messages = state.get("messages", [])
+        try:
+            result = self._agent.invoke({"messages": input_messages}, config=runtime_config, version="v2")
+            state = result.value if hasattr(result, "value") else result
+            output_messages = state.get("messages", [])
+        except Exception as exc:
+            error_msg = f"Agent 调用失败: {exc}"
+            generated = [{"role": "assistant", "content": error_msg}]
+            self._append_and_save_history(sid, history, message, generated)
+            return error_msg, sid
 
         generated_objects = output_messages[len(input_messages) :] if len(output_messages) >= len(input_messages) else []
         generated = [msg for msg in (message_to_history(obj) for obj in generated_objects) if msg is not None]
@@ -975,6 +1038,13 @@ class CrabClawAgent:
     async def astream_chat(self, message: str, session_id: str | None = None, skill_id: str | None = None) -> AsyncIterator[dict]:
         sid = session_id or self.create_session()
         self._current_session_id = sid
+
+        first_contact_response = self._handle_first_contact_gate(message)
+        if first_contact_response is not None:
+            yield {"event": "session", "data": {"session_id": sid}}
+            yield {"event": "chunk", "data": {"content": first_contact_response}}
+            yield {"event": "done", "data": {"content": first_contact_response, "session_id": sid}}
+            return
 
         data = self.workspace.load_session_data(sid)
         history = data.get("messages", [])
@@ -1126,6 +1196,30 @@ class CrabClawAgent:
                                     seen_signatures.add(signature)
                                     generated.append(converted)
 
+                            # Emit tool_start/tool_end events for streaming visibility
+                            if isinstance(msg, AIMessage) and msg.tool_calls:
+                                for tc in msg.tool_calls:
+                                    yield {
+                                        "event": "tool_start",
+                                        "data": {
+                                            "tool_name": tc.get("name", ""),
+                                            "tool_args": tc.get("args", {}),
+                                            "tool_call_id": tc.get("id", ""),
+                                        },
+                                    }
+                            elif isinstance(msg, ToolMessage):
+                                tc_id = getattr(msg, "tool_call_id", "")
+                                content = str(getattr(msg, "content", ""))
+                                failed = self._is_tool_failure_content(content)
+                                yield {
+                                    "event": "tool_end",
+                                    "data": {
+                                        "tool_call_id": tc_id or "",
+                                        "success": not failed,
+                                        "summary": self._brief_tool_content(content),
+                                    },
+                                }
+
             if not full_text:
                 text_from_messages = find_final_assistant_text(final_messages)
                 if text_from_messages:
@@ -1175,6 +1269,8 @@ class CrabClawAgent:
                 },
             }
         except Exception as exc:
+            import logging
+            logging.getLogger("crabclaw").error("Agent stream error in session %s: %s", sid, exc)
             error_text = str(exc)
             if not any(m.get("role") == "assistant" and (m.get("content") or "").strip() for m in generated):
                 generated.append({"role": "assistant", "content": f"处理失败：{error_text}"})

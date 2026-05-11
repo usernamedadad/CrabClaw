@@ -13,7 +13,15 @@
 
     <div class="messages" ref="messageContainer">
       <template v-for="item in messages" :key="item.id">
-        <div v-if="item.kind === 'chat'" class="msg-row" :class="item.role">
+        <div v-if="item.kind === 'tool'" class="tool-card" :class="item.toolState || 'running'">
+          <span class="tool-icon">
+            <template v-if="item.toolState === 'success'">✅</template>
+            <template v-else-if="item.toolState === 'error'">❌</template>
+            <template v-else>🔧</template>
+          </span>
+          <span class="tool-label">{{ item.content }}</span>
+        </div>
+        <div v-else-if="item.kind === 'chat'" class="msg-row" :class="item.role">
           <img v-if="item.role === 'assistant'" src="/crabclaw.png" alt="assistant" class="avatar" />
 
           <div class="msg-body">
@@ -94,6 +102,7 @@ import MarkdownIt from 'markdown-it'
 import { chatApi } from '../api/chat'
 import { sessionApi, type ChatMessage } from '../api/session'
 import { skillsApi, type SkillItem } from '../api/skills'
+import { useSessionStore } from '../stores/session'
 
 interface RenderMessage {
   id: string
@@ -105,12 +114,14 @@ interface RenderMessage {
   pending?: boolean
 }
 
-const SESSION_KEY = 'crabclaw.session_id'
-const SESSION_CHANGED_EVENT = 'crabclaw:session-changed'
+const store = useSessionStore()
 
 const input = ref('')
 const streaming = ref(false)
-const currentSessionId = ref<string | null>(localStorage.getItem(SESSION_KEY))
+const currentSessionId = computed({
+  get: () => store.currentSessionId,
+  set: (val) => store.setSessionId(val),
+})
 const messages = ref<RenderMessage[]>([])
 const messageContainer = ref<HTMLElement>()
 const composerWrap = ref<HTMLElement>()
@@ -127,7 +138,6 @@ const selectedSkillName = computed(() => {
   const match = skills.value.find((item) => item.id === selectedSkillId.value)
   return match?.name || selectedSkillId.value
 })
-const filteredSkills = computed(() => skills.value)
 let shiftTimer: ReturnType<typeof setTimeout> | null = null
 
 const markdown = new MarkdownIt({
@@ -201,31 +211,14 @@ async function loadHistory() {
       mapHistoryMessage(msg)
     }
     await scrollToBottom()
-  } catch {
-    // ignore history errors
+  } catch (err) {
+    console.error('Failed to load session history:', err)
   }
-}
-
-function handleSessionChanged(event: Event) {
-  const detail = (event as CustomEvent<{ sessionId?: string }>).detail
-  const nextSessionId = detail?.sessionId || localStorage.getItem(SESSION_KEY)
-  if (!nextSessionId) {
-    return
-  }
-
-  if (currentSessionId.value === nextSessionId) {
-    return
-  }
-
-  currentSessionId.value = nextSessionId
-  loadHistory()
 }
 
 async function createSession() {
   const res = await sessionApi.create()
   currentSessionId.value = res.data.session_id
-  localStorage.setItem(SESSION_KEY, res.data.session_id)
-  window.dispatchEvent(new CustomEvent(SESSION_CHANGED_EVENT, { detail: { sessionId: res.data.session_id } }))
   messages.value = []
 }
 
@@ -356,8 +349,6 @@ async function sendMessage() {
       (event) => {
         if (event.type === 'session' && event.session_id) {
           currentSessionId.value = event.session_id
-          localStorage.setItem(SESSION_KEY, event.session_id)
-          window.dispatchEvent(new CustomEvent(SESSION_CHANGED_EVENT, { detail: { sessionId: event.session_id } }))
         }
         if (event.type === 'chunk') {
           if (event.content) {
@@ -369,10 +360,31 @@ async function sendMessage() {
         if (event.type === 'done' && event.session_id) {
           streamDone = true
           currentSessionId.value = event.session_id
-          localStorage.setItem(SESSION_KEY, event.session_id)
-          window.dispatchEvent(new CustomEvent(SESSION_CHANGED_EVENT, { detail: { sessionId: event.session_id } }))
           if (!assistant.content.trim()) {
             messages.value = messages.value.filter((item) => item.id !== assistant.id)
+          }
+        }
+        if (event.type === 'tool_start') {
+          assistant.pending = false
+          const toolId = `tool-${event.tool_call_id || Date.now()}`
+          messages.value.push({
+            id: toolId,
+            kind: 'tool',
+            role: 'assistant',
+            content: event.tool_name || '',
+            time: nowText(),
+            toolState: undefined,
+          })
+          scrollToBottom()
+        }
+        if (event.type === 'tool_end') {
+          const toolId = `tool-${event.tool_call_id || ''}`
+          const existing = messages.value.find((m) => m.id === toolId)
+          if (existing) {
+            existing.toolState = event.success ? 'success' : 'error'
+            if (event.summary) {
+              existing.content = `${existing.content}: ${event.summary}`
+            }
           }
         }
         if (event.type === 'error') {
@@ -388,10 +400,13 @@ async function sendMessage() {
   } catch (error) {
     streamFailed = true
     assistant.pending = false
-    antdMessage.error('处理失败，请稍后重试')
     if (!assistant.content.trim()) {
-      assistant.content = `处理失败：${briefError((error as Error).message || '')}`
+      const errMsg = briefError((error as Error).message || '')
+      assistant.content = `连接中断：${errMsg}`
+    } else {
+      assistant.content += '\n\n⚠️ 连接中断，部分内容可能丢失'
     }
+    antdMessage.warning('连接中断，可以重试发送')
   } finally {
     streaming.value = false
     if (streamDone || streamFailed) {
@@ -404,11 +419,19 @@ onMounted(async () => {
   if (!currentSessionId.value) {
     await createSession()
   }
-  window.addEventListener(SESSION_CHANGED_EVENT, handleSessionChanged as EventListener)
   document.addEventListener('mousedown', handleDocumentMouseDown)
   await ensureSkillsLoaded()
   await loadHistory()
 })
+
+watch(
+  () => store.currentSessionId,
+  (nextId, prevId) => {
+    if (nextId && nextId !== prevId) {
+      loadHistory()
+    }
+  }
+)
 
 watch(
   () => isSkillMode.value,
@@ -425,7 +448,6 @@ watch(
 )
 
 onUnmounted(() => {
-  window.removeEventListener(SESSION_CHANGED_EVENT, handleSessionChanged as EventListener)
   document.removeEventListener('mousedown', handleDocumentMouseDown)
   if (shiftTimer) {
     clearTimeout(shiftTimer)
@@ -506,6 +528,32 @@ onUnmounted(() => {
   gap: 10px;
   margin: 16px auto;
   width: min(980px, 96%);
+}
+
+.tool-card {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  font-size: 13px;
+  color: #666;
+  margin: 2px 0 2px 42px;
+}
+.tool-card.running .tool-icon {
+  animation: spin 1s linear infinite;
+}
+.tool-card.success {
+  color: #52c41a;
+}
+.tool-card.error {
+  color: #ff4d4f;
+}
+.tool-icon {
+  font-size: 14px;
+}
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
 }
 
 .msg-row.user {

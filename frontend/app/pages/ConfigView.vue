@@ -54,13 +54,17 @@ const form = reactive({
 })
 
 async function load() {
-  const llmRes = await configApi.getLLM()
+  try {
+    const llmRes = await configApi.getLLM()
 
-  form.model_id = llmRes.data.model_id || ''
-  form.api_key = llmRes.data.api_key || ''
-  form.base_url = llmRes.data.base_url || ''
-  form.temperature = Number.isFinite(llmRes.data.temperature) ? Number(llmRes.data.temperature) : 0.4
-  form.search_api_key = llmRes.data.search_api_key || ''
+    form.model_id = llmRes.data.model_id || ''
+    form.api_key = llmRes.data.api_key || ''
+    form.base_url = llmRes.data.base_url || ''
+    form.temperature = Number.isFinite(llmRes.data.temperature) ? Number(llmRes.data.temperature) : 0.4
+    form.search_api_key = llmRes.data.search_api_key || ''
+  } catch (err) {
+    console.error('Failed to load LLM config:', err)
+  }
 }
 
 async function save() {

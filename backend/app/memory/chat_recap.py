@@ -88,7 +88,9 @@ class SessionSummarizer:
             if not text:
                 return self._simple_summary(excerpt)
             return self._header() + str(text)
-        except Exception:
+        except Exception as exc:
+            import logging
+            logging.getLogger("crabclaw").warning("Session summary via LLM failed, using simple fallback: %s", exc)
             return self._simple_summary(excerpt)
 
     @staticmethod

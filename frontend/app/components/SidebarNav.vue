@@ -89,9 +89,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { message } from 'ant-design-vue'
 
 import { sessionApi, type Session } from '../api/session'
-
-const SESSION_KEY = 'crabclaw.session_id'
-const SESSION_CHANGED_EVENT = 'crabclaw:session-changed'
+import { useSessionStore } from '../stores/session'
 
 withDefaults(
   defineProps<{
@@ -118,11 +116,16 @@ const links = [
   { to: '/config', label: '模型与API', icon: '⚙' }
 ]
 
+const store = useSessionStore()
+
 const route = useRoute()
 const router = useRouter()
 const sessionsLoading = ref(false)
 const recentSessions = ref<Session[]>([])
-const currentSessionId = ref<string | null>(localStorage.getItem(SESSION_KEY))
+const currentSessionId = computed({
+  get: () => store.currentSessionId,
+  set: (val) => store.setSessionId(val),
+})
 const contextMenuOpen = ref(false)
 const contextMenuX = ref(0)
 const contextMenuY = ref(0)
@@ -159,7 +162,6 @@ async function loadRecentSessions() {
     const res = await sessionApi.list()
     const sorted = [...(res.data.sessions || [])].sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0))
     recentSessions.value = sorted
-    currentSessionId.value = localStorage.getItem(SESSION_KEY)
   } catch {
     recentSessions.value = []
   } finally {
@@ -175,8 +177,6 @@ async function switchSession(sessionId: string) {
   }
 
   currentSessionId.value = sessionId
-  localStorage.setItem(SESSION_KEY, sessionId)
-  window.dispatchEvent(new CustomEvent(SESSION_CHANGED_EVENT, { detail: { sessionId } }))
   if (route.path !== '/chat') {
     await router.push('/chat')
   }
@@ -220,14 +220,6 @@ async function deleteSessionFromHistory(item: Session) {
       const fallbackId = recentSessions.value[0]?.id || null
       currentSessionId.value = fallbackId
 
-      if (fallbackId) {
-        localStorage.setItem(SESSION_KEY, fallbackId)
-      } else {
-        localStorage.removeItem(SESSION_KEY)
-      }
-
-      window.dispatchEvent(new CustomEvent(SESSION_CHANGED_EVENT, { detail: { sessionId: fallbackId || undefined } }))
-
       if (route.path !== '/chat') {
         await router.push('/chat')
       }
@@ -254,11 +246,6 @@ function handleEscapeKey(event: KeyboardEvent) {
   }
 }
 
-function handleSessionChanged(event: Event) {
-  const detail = (event as CustomEvent<{ sessionId?: string }>).detail
-  currentSessionId.value = detail?.sessionId || localStorage.getItem(SESSION_KEY)
-}
-
 watch(
   () => route.fullPath,
   () => {
@@ -269,12 +256,10 @@ watch(
 
 onMounted(() => {
   loadRecentSessions()
-  window.addEventListener(SESSION_CHANGED_EVENT, handleSessionChanged as EventListener)
   window.addEventListener('keydown', handleEscapeKey)
 })
 
 onUnmounted(() => {
-  window.removeEventListener(SESSION_CHANGED_EVENT, handleSessionChanged as EventListener)
   window.removeEventListener('keydown', handleEscapeKey)
 })
 </script>

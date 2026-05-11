@@ -67,14 +67,17 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, onUnmounted, reactive, ref } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { message } from 'ant-design-vue'
 import { sessionApi, type Session } from '../api/session'
+import { useSessionStore } from '../stores/session'
 
-const SESSION_KEY = 'crabclaw.session_id'
-const SESSION_CHANGED_EVENT = 'crabclaw:session-changed'
+const store = useSessionStore()
 const sessions = ref<Session[]>([])
-const currentSessionId = ref<string | null>(localStorage.getItem(SESSION_KEY))
+const currentSessionId = computed({
+  get: () => store.currentSessionId,
+  set: (val) => store.setSessionId(val),
+})
 const createOpen = ref(false)
 const creating = ref(false)
 const createForm = reactive({
@@ -87,14 +90,7 @@ async function load() {
   sessions.value = res.data.sessions
   if (currentSessionId.value && !sessions.value.some((item) => item.id === currentSessionId.value)) {
     currentSessionId.value = null
-    localStorage.removeItem(SESSION_KEY)
-    window.dispatchEvent(new CustomEvent(SESSION_CHANGED_EVENT, { detail: { sessionId: undefined } }))
   }
-}
-
-function handleSessionChanged(event: Event) {
-  const detail = (event as CustomEvent<{ sessionId?: string }>).detail
-  currentSessionId.value = detail?.sessionId || localStorage.getItem(SESSION_KEY)
 }
 
 function openCreate() {
@@ -123,8 +119,6 @@ async function submitCreate() {
       description: description || undefined
     })
     currentSessionId.value = res.data.session_id
-    localStorage.setItem(SESSION_KEY, res.data.session_id)
-    window.dispatchEvent(new CustomEvent(SESSION_CHANGED_EVENT, { detail: { sessionId: res.data.session_id } }))
     message.success(`已创建会话 ${res.data.session_id}`)
     createOpen.value = false
     await load()
@@ -137,22 +131,14 @@ async function submitCreate() {
 
 function select(id: string) {
   currentSessionId.value = id
-  localStorage.setItem(SESSION_KEY, id)
-  window.dispatchEvent(new CustomEvent(SESSION_CHANGED_EVENT, { detail: { sessionId: id } }))
   message.success(`已切换会话 ${id}`)
 }
 
 async function remove(id: string) {
   await sessionApi.delete(id)
-  if (localStorage.getItem(SESSION_KEY) === id) {
+  if (currentSessionId.value === id) {
     const fallbackId = sessions.value.find((item) => item.id !== id)?.id || null
     currentSessionId.value = fallbackId
-    if (fallbackId) {
-      localStorage.setItem(SESSION_KEY, fallbackId)
-    } else {
-      localStorage.removeItem(SESSION_KEY)
-    }
-    window.dispatchEvent(new CustomEvent(SESSION_CHANGED_EVENT, { detail: { sessionId: fallbackId || undefined } }))
   }
   message.success('已删除会话')
   await load()
@@ -160,11 +146,9 @@ async function remove(id: string) {
 
 onMounted(() => {
   load()
-  window.addEventListener(SESSION_CHANGED_EVENT, handleSessionChanged as EventListener)
 })
 
 onUnmounted(() => {
-  window.removeEventListener(SESSION_CHANGED_EVENT, handleSessionChanged as EventListener)
 })
 </script>
 

@@ -38,9 +38,11 @@ async def get_agent_info():
 async def get_llm_config():
     ws = get_workspace()
     cfg = ws.get_llm_config()
+    raw_key = cfg.get("api_key", "")
+    masked = raw_key if len(raw_key) <= 8 else raw_key[:3] + "***" + raw_key[-3:]
     return LLMConfig(
         model_id=cfg.get("model_id", ""),
-        api_key=cfg.get("api_key", ""),
+        api_key=masked,
         base_url=cfg.get("base_url", ""),
         temperature=cfg.get("temperature", 0.4),
         search_api_key=ws.get_search_api_key(),

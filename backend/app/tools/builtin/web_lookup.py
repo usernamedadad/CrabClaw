@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 import os
 import urllib.parse
-import urllib.request
+
+import httpx
 
 
 class WebSearchTool:
@@ -35,13 +36,12 @@ class WebSearchTool:
             "api_key": self.api_key,
         }
         url = f"{self.base_url}?{urllib.parse.urlencode(params)}"
-        req = urllib.request.Request(url)
-        req.add_header("Accept", "application/json")
 
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                payload = json.loads(resp.read().decode("utf-8"))
-        except Exception as exc:
+            resp = httpx.get(url, headers={"Accept": "application/json"}, timeout=self.timeout)
+            resp.raise_for_status()
+            payload = resp.json()
+        except httpx.HTTPError as exc:
             return f"Web search failed: {exc}"
 
         items = payload.get("organic_results", [])

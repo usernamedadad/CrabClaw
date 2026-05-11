@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from contextlib import asynccontextmanager
 
@@ -10,11 +11,23 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .agent import CrabClawAgent
-from .api import abilities, conversation, history, journal, settings
+from .api import abilities, conversation, history, journal, rag, settings
 from .app_state import set_agent, set_workspace
 from .workspace.hub import WorkspaceManager
 
 load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(
+            os.path.expanduser("~/.crabclaw/app.log"), encoding="utf-8"
+        ),
+    ],
+)
+logging.getLogger("crabclaw").setLevel(logging.DEBUG)
 
 
 @asynccontextmanager
@@ -57,6 +70,7 @@ app.include_router(history.router, prefix="/api")
 app.include_router(settings.router, prefix="/api")
 app.include_router(journal.router, prefix="/api")
 app.include_router(abilities.router, prefix="/api")
+app.include_router(rag.router, prefix="/api")
 
 
 @app.get("/api")

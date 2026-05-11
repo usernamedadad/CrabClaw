@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import re
-import urllib.request
+
+import httpx
 
 
 class WebFetchTool:
@@ -16,17 +17,19 @@ class WebFetchTool:
         if not url.startswith(("http://", "https://")):
             return "URL must start with http:// or https://"
 
-        req = urllib.request.Request(url)
-        req.add_header("User-Agent", self.user_agent)
-        req.add_header("Accept", "text/html,application/xhtml+xml")
-
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                ctype = resp.headers.get("Content-Type", "")
-                if "text/html" not in ctype:
-                    return f"Unsupported content type: {ctype}"
-                html = resp.read().decode("utf-8", errors="ignore")
-        except Exception as exc:
+            resp = httpx.get(
+                url,
+                headers={"User-Agent": self.user_agent, "Accept": "text/html,application/xhtml+xml"},
+                timeout=self.timeout,
+                follow_redirects=True,
+            )
+            resp.raise_for_status()
+            ctype = resp.headers.get("Content-Type", "")
+            if "text/html" not in ctype:
+                return f"Unsupported content type: {ctype}"
+            html = resp.text
+        except httpx.HTTPError as exc:
             return f"Fetch failed: {exc}"
 
         md = self._html_to_text(html)

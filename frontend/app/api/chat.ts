@@ -1,10 +1,15 @@
 import { API_BASE } from './index'
 
 export interface StreamEvent {
-  type: 'session' | 'chunk' | 'done' | 'error'
+  type: 'session' | 'chunk' | 'done' | 'error' | 'tool_start' | 'tool_end'
   content?: string
   session_id?: string | null
   error?: string
+  tool_name?: string
+  tool_args?: Record<string, unknown>
+  tool_call_id?: string
+  success?: boolean
+  summary?: string
 }
 
 export interface ChatResponse {
@@ -89,6 +94,20 @@ export const chatApi = {
             } else if (activeEvent === 'done') {
               finalSessionId = parsed.session_id ?? finalSessionId
               onEvent({ type: 'done', content: parsed.content || fullText, session_id: finalSessionId })
+            } else if (activeEvent === 'tool_start') {
+              onEvent({
+                type: 'tool_start',
+                tool_name: parsed.tool_name || '',
+                tool_args: parsed.tool_args || {},
+                tool_call_id: parsed.tool_call_id || '',
+              })
+            } else if (activeEvent === 'tool_end') {
+              onEvent({
+                type: 'tool_end',
+                tool_call_id: parsed.tool_call_id || '',
+                success: !!parsed.success,
+                summary: parsed.summary || '',
+              })
             } else if (activeEvent === 'error') {
               onEvent({ type: 'error', error: parsed.error || 'Unknown error' })
             }

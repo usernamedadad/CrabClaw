@@ -48,21 +48,6 @@ async def chat_stream(request: ChatRequest):
     return await _stream_response(request)
 
 
-@router.post("/send/stream", summary="Send message stream (compat)")
-async def chat_stream_compat(request: ChatRequest):
-    return await _stream_response(request)
-
-
-@router.post("/send/sync", response_model=ChatResponse)
-async def chat_sync(request: ChatRequest):
-    agent = get_agent()
-    try:
-        content, session_id = agent.chat(request.message, request.session_id, request.skill_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return ChatResponse(content=content, session_id=session_id)
-
-
 @router.post("/send", response_model=ChatResponse)
 async def chat_send(request: ChatRequest):
     agent = get_agent()
