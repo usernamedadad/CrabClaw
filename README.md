@@ -1,6 +1,6 @@
 # 🦀CrabClaw
 
-CrabClaw 是一个轻量、实用的 AI Agent 协作助手，前后端分离架构，支持 Web UI、CLI 终端双端交互。
+CrabClaw 是一个轻量、实用的 AI Agent 个性化协作助手，前后端分离架构，支持 Web UI、CLI 终端双端交互。
 
 ## 🌟项目亮点
 
