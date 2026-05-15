@@ -10,6 +10,10 @@ from .policy import LocalToolPolicy
 class WorkspaceFileTool:
     def __init__(self, workspace_manager):
         self.workspace = workspace_manager
+        self._read_cache: dict[tuple[str, int, int], str] = {}
+
+    def clear_read_cache(self) -> None:
+        self._read_cache.clear()
 
     def _default_output_dir(self) -> Path:
         preferred = self.workspace.workspace_path / "claw_file"
@@ -81,6 +85,11 @@ class WorkspaceFileTool:
         start = max(1, int(start_line or 1))
         end = max(start, int(end_line or start))
 
+        cache_key = (str(resolved), start, end)
+        cached = self._read_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         try:
             lines = resolved.read_text(encoding="utf-8").splitlines()
         except UnicodeDecodeError:
@@ -99,6 +108,7 @@ class WorkspaceFileTool:
         text, clipped = policy.clip_text(header + "\n" + body)
         if clipped:
             text += "\n... (truncated by max_output_chars)"
+        self._read_cache[cache_key] = text
         return text
 
     def write_text(self, path: str, content: str, mode: str = "overwrite") -> str:

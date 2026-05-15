@@ -27,6 +27,20 @@ class LLMConfigUpdateRequest(BaseModel):
     llm: LLMConfig
 
 
+class PersonalityOption(BaseModel):
+    id: str
+    label: str
+    description: str
+
+
+PERSONALITIES = [
+    {"id": "steady", "label": "稳重", "description": "保持稳重、可靠，不急于下结论，步步为营"},
+    {"id": "creative", "label": "创意", "description": "鼓励创造性思维，多提新思路和可能性"},
+    {"id": "concise", "label": "简洁", "description": "极度简洁，只说必要的，不啰嗦"},
+    {"id": "detailed", "label": "详细", "description": "详细解释每一步，不省略关键细节"},
+]
+
+
 @router.get("/agent/info", response_model=AgentInfo)
 async def get_agent_info():
     ws = get_workspace()
@@ -77,6 +91,11 @@ async def update_llm_config(request: LLMConfigUpdateRequest):
         temperature=request.llm.temperature,
         search_api_key=request.llm.search_api_key,
     )
+
+
+@router.get("/personalities")
+async def list_personalities():
+    return {"items": [PersonalityOption(**p) for p in PERSONALITIES]}
 
 
 @router.get("/list")

@@ -5,17 +5,21 @@ from __future__ import annotations
 import logging
 import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .agent import CrabClawAgent
-from .api import abilities, conversation, history, journal, rag, settings
+from .api import abilities, conversation, history, journal, settings
 from .app_state import set_agent, set_workspace
 from .workspace.hub import WorkspaceManager
 
-load_dotenv()
+load_dotenv(dotenv_path=Path(__file__).parent.parent / ".env")
+
+log_dir = os.path.expanduser("~/.crabclaw")
+os.makedirs(log_dir, exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,7 +27,7 @@ logging.basicConfig(
     handlers=[
         logging.StreamHandler(),
         logging.FileHandler(
-            os.path.expanduser("~/.crabclaw/app.log"), encoding="utf-8"
+            os.path.join(log_dir, "app.log"), encoding="utf-8"
         ),
     ],
 )
@@ -70,7 +74,6 @@ app.include_router(history.router, prefix="/api")
 app.include_router(settings.router, prefix="/api")
 app.include_router(journal.router, prefix="/api")
 app.include_router(abilities.router, prefix="/api")
-app.include_router(rag.router, prefix="/api")
 
 
 @app.get("/api")

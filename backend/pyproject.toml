@@ -13,6 +13,7 @@ dependencies = [
     "langchain-openai>=1.1",
     "httpx>=0.28",
     "rank-bm25>=0.2",
+    "tiktoken>=0.12",
 ]
 [project.scripts]
 crabclaw = "app.cli:main"

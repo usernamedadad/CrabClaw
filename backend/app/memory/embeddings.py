@@ -35,6 +35,8 @@ class EmbeddingIndex:
         self.model = model
         self._cache: dict[str, list[float]] = {}
         self._loaded = False
+        self._embed_cache: dict[str, list[float]] = {}
+        self._MAX_EMBED_CACHE = 1024
 
     # ------------------------------------------------------------------
     # public API
@@ -106,6 +108,10 @@ class EmbeddingIndex:
     # ------------------------------------------------------------------
 
     def _embed(self, text: str) -> Optional[list[float]]:
+        key = hashlib.sha256(text.encode()).hexdigest()
+        if key in self._embed_cache:
+            return self._embed_cache[key]
+
         endpoint = self._embeddings_url()
         try:
             resp = httpx.post(
@@ -117,7 +123,12 @@ class EmbeddingIndex:
             resp.raise_for_status()
             data = resp.json()
             vec = data["data"][0]["embedding"]
-            return [float(v) for v in vec]
+            result = [float(v) for v in vec]
+            if len(self._embed_cache) >= self._MAX_EMBED_CACHE:
+                oldest = next(iter(self._embed_cache))
+                self._embed_cache.pop(oldest, None)
+            self._embed_cache[key] = result
+            return result
         except Exception:
             return None
 

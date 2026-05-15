@@ -206,10 +206,21 @@ async function loadHistory() {
   if (!currentSessionId.value) return
   try {
     const res = await sessionApi.getHistory(currentSessionId.value)
-    messages.value = []
+    // 先拉取数据，成功后再替换本地消息，避免清空后网络失败导致空白
+    const newMessages: RenderMessage[] = []
     for (const msg of res.data.messages) {
-      mapHistoryMessage(msg)
+      if (msg.role === 'tool') continue
+      if (!msg.content) continue
+      newMessages.push({
+        id: msg.id || `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        kind: 'chat',
+        role: msg.role,
+        content: msg.content,
+        time: nowText(),
+        pending: false,
+      })
     }
+    messages.value = newMessages
     await scrollToBottom()
   } catch (err) {
     console.error('Failed to load session history:', err)
@@ -409,9 +420,8 @@ async function sendMessage() {
     antdMessage.warning('连接中断，可以重试发送')
   } finally {
     streaming.value = false
-    if (streamDone || streamFailed) {
-      await loadHistory()
-    }
+    // 流结束后不主动拉取历史：本地消息已在 SSE 流中逐块累积完整，
+    // 服务端保存的与本地一致。仅在用户手动刷新/切换会话时才走 loadHistory。
   }
 }
 
@@ -427,7 +437,9 @@ onMounted(async () => {
 watch(
   () => store.currentSessionId,
   (nextId, prevId) => {
-    if (nextId && nextId !== prevId) {
+    // 流式响应进行中时不触发 loadHistory，避免清空已显示的本地消息
+    // 仅在非流状态且会话 ID 真正变化时（用户切换会话）才重新拉取
+    if (nextId && nextId !== prevId && !streaming.value) {
       loadHistory()
     }
   }

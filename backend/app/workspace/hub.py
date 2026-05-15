@@ -59,7 +59,7 @@ USER_FIELDS = ["称呼", "长期目标", "输出语言", "回答长度", "沟通
 USER_REQUIRED_FIELDS = ["称呼", "长期目标", "输出语言", "回答长度", "沟通节奏"]
 SOUL_FIELDS = ["核心准则", "边界", "风格"]
 
-TEMPLATES_DIR = Path(__file__).parent / "presets"
+TEMPLATES_DIR = Path(__file__).parent / "prompt"
 
 
 def canonical_config_name(name: str) -> str:
@@ -142,6 +142,9 @@ class WorkspaceManager:
         self._embeddings_path = self.memory_path / ".embeddings"
         self._embedding_index: Optional["EmbeddingIndex"] = None
         self._memory_content_hash = ""
+        self._config_cache: Dict[str, tuple[float, str]] = {}
+        self._session_cache: Dict[str, dict] = {}
+        self._MAX_SESSION_CACHE = 64
 
     @property
     def global_config_path(self) -> Path:
@@ -244,11 +247,22 @@ class WorkspaceManager:
     def load_config(self, name: str) -> Optional[str]:
         path = self.get_config_path(name)
         if not path.exists():
+            self._config_cache.pop(name, None)
             return None
-        return path.read_text(encoding="utf-8")
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            return path.read_text(encoding="utf-8")
+        cached = self._config_cache.get(name)
+        if cached and cached[0] == mtime:
+            return cached[1]
+        content = path.read_text(encoding="utf-8")
+        self._config_cache[name] = (mtime, content)
+        return content
 
     def save_config(self, name: str, content: str) -> None:
         self.get_config_path(name).write_text(content, encoding="utf-8")
+        self._config_cache.pop(name, None)
 
     def get_active_context_path(self) -> Path:
         return self.memory_path / "active_context.md"
@@ -298,6 +312,11 @@ class WorkspaceManager:
     def get_search_api_key(self) -> str:
         cfg = self.load_global_config().get("tools", {})
         return cfg.get("serpapi_api") or os.getenv("SERPAPI_API", "")
+
+    def get_personality(self) -> str:
+        cfg = self.load_global_config()
+        agent_cfg = cfg.get("agent", {}) if isinstance(cfg, dict) else {}
+        return str(agent_cfg.get("personality", "steady") or "steady").strip().lower()
 
     def _install_preset_skills(self) -> None:
         presets_dir = TEMPLATES_DIR.parent / "presets" / "skills"
@@ -942,36 +961,54 @@ class WorkspaceManager:
     def session_exists(self, session_id: str) -> bool:
         return self.session_file(session_id).exists()
 
+    def _cache_session(self, session_id: str, data: dict) -> None:
+        if len(self._session_cache) >= self._MAX_SESSION_CACHE:
+            oldest = next(iter(self._session_cache))
+            self._session_cache.pop(oldest, None)
+        self._session_cache[session_id] = data
+
     def load_session_data(self, session_id: str) -> dict:
+        cached = self._session_cache.get(session_id)
+        if cached is not None:
+            return cached
+
         path = self.session_file(session_id)
         if not path.exists():
-            return {
+            data = {
                 "id": session_id,
                 "created_at": datetime.now().timestamp(),
                 "updated_at": datetime.now().timestamp(),
                 "messages": [],
             }
+            self._cache_session(session_id, data)
+            return data
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(path.read_text(encoding="utf-8"))
+            self._cache_session(session_id, data)
+            return data
         except (json.JSONDecodeError, OSError):
-            return {
+            data = {
                 "id": session_id,
                 "created_at": datetime.now().timestamp(),
                 "updated_at": datetime.now().timestamp(),
                 "messages": [],
             }
+            self._cache_session(session_id, data)
+            return data
 
     def save_session_data(self, session_id: str, data: dict) -> None:
         now = datetime.now().timestamp()
         data.setdefault("id", session_id)
         data.setdefault("created_at", now)
         data["updated_at"] = now
+        self._cache_session(session_id, data)
         self.session_file(session_id).write_text(
             json.dumps(data, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
 
     def delete_session(self, session_id: str) -> bool:
+        self._session_cache.pop(session_id, None)
         path = self.session_file(session_id)
         if not path.exists():
             return False

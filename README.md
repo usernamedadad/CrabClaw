@@ -1,26 +1,25 @@
-# 🦀CrabClaw
+# 🦀 CrabClaw
 
 CrabClaw 是一个轻量、实用的 AI Agent 个性化协作助手，前后端分离架构，支持 Web UI、CLI 终端双端交互。
 
-## 🌟项目亮点
+## 🚀功能特性
 
-- 双端交互：Web UI（Vue3 + Ant Design）+ CLI 终端（交互式 REPL / 单次查询 / 管道输入），共享同一 Agent 引擎
-- 流式工具可见：工具调用（搜索、文件读写、命令执行）以实时卡片形式展示，执行状态和耗时一目了然
-- 语义记忆检索：BM25 + embedding 向量混合排序，支持模糊语义回想（搜"暗色"命中"dark 模式"）
-- RAG 文档检索：支持 20+ 种文本格式摄入，上传即问，检索结果自动注入 Agent 上下文
-- 技能化扩展：预置 3 个技能（代码审查/翻译/文档撰写），支持本地 / URL 一键安装
-- 多层安全：6 层命令执行安全机制（白名单 + 目录沙箱 + 风险拦截 + 管道阻断 + 超时控制 + 审计日志）
+### 双端共用
+Web 界面和 CLI 终端共享同一套工作区、记忆和会话。
 
-## 🚀核心功能
+### 身份定制
+可自定义 Agent 的身份和个性，打造专属的 AI 助手。
+### 记忆系统
+自动捕获偏好和决策，跨天反复提及的内容沉淀为长期记忆，支持关键词和语义混合搜索。
 
-- 智能对话：SSE 流式回复 + 入职引导（首次对话自动收集偏好），上下文连贯自然
-- 会话管理：创建、切换、删除、自定义会话信息，Pinia 统一状态管理
-- 记忆系统：规则驱动自动捕获 + 语义向量检索 + 敏感信息脱敏 + 跨日重复自动晋升长期记忆
-- RAG 检索：上传文档 → 自动分块向量化 → 对话中语义检索相关片段 → 注入上下文回答
-- 技能中心：3 个预置技能开箱即用，支持本地导入 / URL 下载 / 自定义安装
-- 工具调用：23 个内置工具（记忆、搜索、文件、命令、RAG、日期、计算器等），流式状态实时可见
-- 配置中心：在线修改模型参数、API Key、服务地址，支持 OpenAI 兼容 API
-- CLI 终端：`crabclaw` 命令支持交互式对话、单次查询、管道输入、文档索引
+### 工具调用透明
+Agent 调用工具时实时展示工具名称、参数和返回结果，不是黑盒。
+
+### 命令安全
+六层防护：命令白名单、目录沙箱、风险词拦截、管道禁用、超时控制、审计日志。
+
+### 可扩展技能
+内置代码审查、翻译、文档撰写，支持本地目录和 URL 远程安装自定义技能。
 
 ## 界面预览
 
@@ -31,15 +30,6 @@ CrabClaw 是一个轻量、实用的 AI Agent 个性化协作助手，前后端�
 浅色模式：
 
 ![CrabClaw Light](data/crabclaw2.jpg)
-
-## 🧩前端可操作
-
-- 对话页：发送消息、流式回复、工具调用卡片、技能触发、入职引导
-- 会话页：创建、切换、删除会话，支持自定义会话 ID
-- 技能页：刷新、本地导入、URL 导入、卸载技能（3 个预置技能开箱即用）
-- 记忆页：查看、编辑、保存、重置记忆文件，语义搜索
-- 工具日志：实时查看工具执行记录
-- 配置页：模型参数、API 密钥、服务地址在线配置
 
 ## 技术栈
 
@@ -69,12 +59,11 @@ crabclaw/
 │  ├─ app/
 │  │  ├─ main.py          # FastAPI 入口
 │  │  ├─ agent/           # Agent 主流程、同步/流式对话
-│  │  ├─ api/             # chat/session/memory/skills/config/rag 接口
+│  │  ├─ api/             # chat/session/memory/skills/config 接口
 │  │  ├─ memory/          # 记忆系统（捕获/语义检索/上下文守卫/embedding）
-│  │  ├─ rag/             # RAG 文档检索（ingester/retriever）
 │  │  ├─ cli/             # CLI 终端（main/repl/render/stream）
 │  │  ├─ skills/          # Skills 注册与安装管理
-│  │  ├─ tools/           # 23 个内置工具 + 命令安全策略
+│  │  ├─ tools/           # 内置工具 + 命令安全策略
 │  │  └─ workspace/       # 本地工作区与配置管理
 │  ├─ pyproject.toml      # ruff 配置 + CLI 入口点
 │  └─ requirements.txt
@@ -143,10 +132,33 @@ LLM_BASE_URL=https://api.openai.com/v1
 
 ```env
 LLM_TEMPERATURE=0.4
+PORT=8000
 CORS_ORIGINS=http://localhost:725
 WORKSPACE_PATH=~/.crabclaw/workspace
 SERPAPI_API=                   # 搜索引擎 API key（可选）
 ```
+
+
+## 工作区
+
+CrabClaw 的数据根目录为 `~/.crabclaw/`，结构如下：
+
+```text
+~/.crabclaw/
+├─ config.json              # LLM 配置与工具开关
+├─ defaults.json            # 默认参数回退值
+└─ workspace/
+   ├─ AGENTS.md             # Agent 工作指南
+   ├─ IDENTITY.md           # Agent 身份（名称、角色）
+   ├─ USER.md               # 用户偏好（称呼、语言、目标）
+   ├─ SOUL.md               # 人格模板（准则、边界）
+   ├─ MERMORY.md            # 长期记忆
+   ├─ memory/               # 每日记忆（YYYY-MM-DD.md）
+   ├─ sessions/             # 会话历史 JSON
+   └─ skills/               # 已安装技能目录
+```
+
+六份配置文件共同塑造 Agent 行为，均可手动编辑，修改后 Agent 下次对话自动生效。
 
 ## 🔐安全机制
 
@@ -176,9 +188,6 @@ SERPAPI_API=                   # 搜索引擎 API key（可选）
 | `/api/skills/install/local` | POST | 本地安装技能 |
 | `/api/skills/install/url` | POST | URL 安装技能 |
 | `/api/skills/{skill_id}` | DELETE | 卸载技能 |
-| `/api/rag/ingest` | POST | 上传文档（RAG） |
-| `/api/rag/list` | GET | 已索引文档列表 |
-| `/api/rag/{doc_id}` | DELETE | 删除文档索引 |
 
 ## 🙏致谢
 

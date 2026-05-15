@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 import time
 import uuid
 from typing import Any, AsyncIterator, Dict, List, Optional
 
+import tiktoken
 from langchain.agents import create_agent
 from langchain.tools import tool
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
@@ -17,7 +19,6 @@ from langchain_openai import ChatOpenAI
 from ..memory.chat_recap import SessionSummarizer
 from ..memory.context_guard import MemoryFlushManager
 from ..memory.signal_capture import MemoryCaptureManager
-from ..rag import RagIngester, RagRetriever
 from ..skills import SkillRegistry
 from ..tools import CalculatorTool, DateTimeTool, ExecuteCommandTool, MemoryTool, WebFetchTool, WebSearchTool, WorkspaceFileTool
 from ..workspace.hub import WorkspaceManager, extract_identity_name
@@ -41,14 +42,15 @@ class CrabClawAgent:
         self._memory_capture_manager = MemoryCaptureManager(self.workspace)
         self._memory_flush_manager = MemoryFlushManager()
         self._skill_registry = SkillRegistry(self.workspace)
-        self._rag_dir = self.workspace.workspace_path.parent / "rag"
-        self._rag_index_dir = self._rag_dir / "index"
-        self._rag_docs_dir = self._rag_dir / "docs"
 
         self._agent = None
         self._runtime_snapshot: Optional[tuple[Any, ...]] = None
         self._init_error: Optional[str] = None
         self._current_session_id: Optional[str] = None
+        self._cached_system_prompt: Optional[str] = None
+        self._cached_system_prompt_tokens: Optional[int] = None
+        self._last_prompt_config_hash: str = ""
+        self._tool_failure_counts: Dict[str, int] = {}
 
     def _read_identity_name(self) -> Optional[str]:
         return extract_identity_name(self.workspace.load_config("IDENTITY")) or extract_identity_name(
@@ -255,96 +257,48 @@ class CrabClawAgent:
             entries = [text.strip()]
         return entries
 
-    def _extract_first_contact_fields(self, text: str) -> dict:
-        content = (text or "").strip()
-        if not content:
-            return {}
-
-        fields: dict[str, str] = {}
-
-        name_patterns = [
-            r"(?:^|\n)\s*(?:称呼|称呼我|名字|我的名字|我叫)\s*[：:]\s*([^\n，。,。!?！？]{1,24})",
-            r"(?:叫我|称呼我|我的名字是|我叫)\s*([^\s，。,。!?！？]{1,24})",
-        ]
-        for pattern in name_patterns:
-            matched = re.search(pattern, content, re.IGNORECASE)
-            if matched:
-                fields["display_name"] = self._clean_value(matched.group(1), 24)
-                break
-
-        goal_patterns = [
-            r"(?:^|\n)\s*(?:协作目标|主要诉求|希望你帮我|希望助手帮我|最希望你帮我)\s*[：:]\s*([^\n]{4,180})",
-            r"(?:希望你帮我|最想你帮我|我想让你帮我|请你帮我)\s*([^。！？!?\n]{4,180})",
-        ]
-        for pattern in goal_patterns:
-            matched = re.search(pattern, content, re.IGNORECASE)
-            if matched:
-                fields["goal"] = self._clean_value(matched.group(1), 180)
-                break
-
-        return fields
-
-    def _build_first_contact_prompt(self, profile: dict, missing: List[str]) -> str:
-        known_lines: list[str] = []
-        if profile.get("display_name"):
-            known_lines.append(f"- 已记录称呼：{profile['display_name']}")
-        if profile.get("goal"):
-            known_lines.append(f"- 已记录主要诉求：{profile['goal']}")
-
-        ask_lines: list[str] = []
-        if "display_name" in missing:
-            ask_lines.append("- 你希望我怎么称呼你？")
-        if "goal" in missing:
-            ask_lines.append("- 你最希望我长期重点帮你做什么？")
-
-        prefix = "为了做全局首次初始化（不是每个会话都问），我需要先记住你的长期协作信息。"
-        if known_lines:
-            return (
-                f"{prefix}\n\n"
-                "已记住：\n"
-                + "\n".join(known_lines)
-                + "\n\n"
-                "还差这些信息：\n"
-                + "\n".join(ask_lines)
-            )
-
-        return (
-            f"{prefix}\n\n"
-            "请你一次性告诉我：\n"
-            "- 你希望我怎么称呼你？\n"
-            "- 你最希望我长期重点帮你做什么？"
-        )
-
-    def _handle_first_contact_gate(self, user_message: str) -> Optional[str]:
+    def _needs_bootstrap(self, session_id: str) -> bool:
         if self.workspace.has_completed_first_contact():
+            return False
+        session_data = self.workspace.load_session_data(session_id)
+        existing_messages = session_data.get("messages", [])
+        if existing_messages:
+            return False
+        return True
+
+    def _build_bootstrap_instruction(self) -> Optional[str]:
+        content = (self.workspace.load_config("BOOTSTRAP") or "").strip()
+        if not content:
             return None
-
-        fields = self._extract_first_contact_fields(user_message)
-        if fields:
-            profile = self.workspace.save_first_contact_profile(
-                display_name=fields.get("display_name"),
-                goal=fields.get("goal"),
-            )
-        else:
-            profile = self.workspace.get_onboarding_profile()
-
-        missing: List[str] = []
-        if not profile.get("display_name"):
-            missing.append("display_name")
-        if not profile.get("goal"):
-            missing.append("goal")
-
-        if missing:
-            return self._build_first_contact_prompt(profile, missing)
-
         return (
-            f"收到，已完成首次信息记录。\n"
-            f"- 称呼：{profile.get('display_name')}\n"
-            f"- 长期协作重点：{profile.get('goal')}\n\n"
-            "后续会话我不会再重复询问这些基础信息。现在你可以直接告诉我第一件要推进的事。"
+            content
+            + "\n\n---\n"
+            "当前处于首次初始化阶段。请按照上述引导自然地与用户对话，"
+            "用正常聊天的方式收集以下 5 项用户信息并写入 USER.md："
+            "称呼、长期目标、输出语言、回答长度、沟通节奏。"
+            "全部收集完成后，说「已完成初始化，我们开始推进当前任务。」"
         )
+
+    _PROMPT_CONFIG_NAMES = ["AGENTS", "IDENTITY", "PROFILE", "USER", "SOUL", "MERMORY", "BOOTSTRAP", "HEARTBEAT"]
+    _FAILURE_MARKERS = ["error", "failed", "traceback", "失败", "超时", "未在白名单"]
+    _TOKENIZER_ENCODING = "cl100k_base"
 
     def _build_system_prompt(self) -> str:
+        config_names = self._PROMPT_CONFIG_NAMES
+        hash_parts: list[str] = []
+        for name in config_names:
+            path = self.workspace.get_config_path(name)
+            if path.exists():
+                try:
+                    hash_parts.append(f"{name}:{path.stat().st_mtime}")
+                except OSError:
+                    hash_parts.append(f"{name}:na")
+            else:
+                hash_parts.append(f"{name}:missing")
+        config_hash = hashlib.md5("".join(hash_parts).encode()).hexdigest()
+        if config_hash == self._last_prompt_config_hash and self._cached_system_prompt is not None:
+            return self._cached_system_prompt
+
         base_prompt = (self.workspace.load_config("AGENTS") or "").strip()
         if not base_prompt:
             base_prompt = "你是 CrabClaw，负责把用户目标变成可执行结果。优先真实、可落地、少废话。"
@@ -353,6 +307,24 @@ class CrabClawAgent:
         user_profile = self.workspace.get_user_profile(allow_fallback=True)
         soul_profile = self.workspace.get_soul_profile(allow_fallback=True)
         longterm_memory = (self.workspace.load_config("MERMORY") or "").strip()
+        heartbeat_content = (self.workspace.load_config("HEARTBEAT") or "").strip()
+
+        # 从全局配置加载 personality
+        personality = self.workspace.get_personality()
+        personality_guide = {
+            "steady": "保持稳重、可靠，不急于下结论，步步为营。",
+            "creative": "鼓励创造性思维，多提新思路和可能性。",
+            "concise": "极度简洁，只说必要的，不啰嗦。",
+            "detailed": "详细解释每一步，不省略关键细节。",
+        }
+        personality_instruction = personality_guide.get(personality, personality_guide["steady"])
+
+        # 将 personality 注入人格模板
+        soul_entries = self._build_field_entries(soul_profile, ["核心准则", "边界", "风格"])
+        if personality_instruction:
+            soul_entries.append(f"当前协作风格：{personality_instruction}")
+
+        heartbeat_entries = self._split_paragraphs(heartbeat_content) if heartbeat_content else []
 
         segments = [
             {
@@ -378,8 +350,14 @@ class CrabClawAgent:
             {
                 "key": "soul",
                 "title": "人格模板",
-                "entries": self._build_field_entries(soul_profile, ["核心准则", "边界", "风格"]),
+                "entries": soul_entries,
                 "sep": "\n",
+            },
+            {
+                "key": "heartbeat",
+                "title": "心跳任务",
+                "entries": heartbeat_entries,
+                "sep": "\n\n",
             },
             {
                 "key": "memory",
@@ -398,7 +376,7 @@ class CrabClawAgent:
             return [self._build_segment(seg["title"], seg["entries"], seg["sep"]) for seg in segments]
 
         total_len = len("\n\n".join(build_blocks()))
-        trim_order = ["memory", "soul", "identity", "user", "guide"]
+        trim_order = ["heartbeat", "memory", "soul", "identity", "user", "guide"]
         while total_len > total_limit:
             trimmed = False
             for key in trim_order:
@@ -411,7 +389,11 @@ class CrabClawAgent:
                 break
             total_len = len("\n\n".join(build_blocks()))
 
-        return "\n\n".join(build_blocks()).strip()
+        result = "\n\n".join(build_blocks()).strip()
+        self._last_prompt_config_hash = config_hash
+        self._cached_system_prompt = result
+        self._cached_system_prompt_tokens = None  # invalidated, lazy-recompute
+        return result
 
     def _build_tools(self):
         memory_tool = self._memory_tool
@@ -422,24 +404,24 @@ class CrabClawAgent:
 
         @tool("memory_search")
         def memory_search(keyword: str, context_lines: int = 3) -> str:
-            """按关键词搜索记忆并返回带上下文的结果。"""
+            """按关键词搜索记忆，返回带上下文的结果。"""
             return memory_tool.search(keyword, context_lines)
 
         @tool("memory_get")
         def memory_get(filename: str = "", lines: str = "") -> str:
-            """读取记忆文件，可选行范围（例如 10-20）。"""
+            """读取记忆文件，支持行范围（如 10-20）。"""
             if not filename or len(filename.strip()) < 2:
                 return "请告诉我要读取哪个记忆文件。"
             return memory_tool.get(filename or None, lines or None)
 
         @tool("memory_add")
         def memory_add(content: str, category: str = "") -> str:
-            """新增记忆项，分类可选 preference/decision/entity/fact。"""
+            """新增记忆项，分类: preference/decision/entity/fact。"""
             return memory_tool.add(content, category or None)
 
         @tool("memory_update_longterm")
         def memory_update_longterm(content: str, category: str = "") -> str:
-            """将信息追加到长期记忆，分类可选 preference/decision/entity/fact。"""
+            """追加到长期记忆，分类: preference/decision/entity/fact。"""
             return memory_tool.update_longterm(content, category or None)
 
         @tool("memory_list")
@@ -449,52 +431,63 @@ class CrabClawAgent:
 
         @tool("memory_cleanup")
         def memory_cleanup(days: int = 30) -> str:
-            """删除超过指定天数的每日记忆文件。"""
+            """清理超过 N 天的每日记忆文件。"""
             return memory_tool.cleanup(days)
 
         @tool("memory_get_active_context")
         def memory_get_active_context() -> str:
-            """获取当前任务上下文（记住你在做什么）。"""
+            """获取当前任务上下文。"""
             return memory_tool.get_active_context()
 
         @tool("memory_set_active_context")
         def memory_set_active_context(content: str) -> str:
-            """设置当前任务上下文（保存你在做什么，压缩后不会丢）。"""
+            """设置当前任务上下文，压缩后不丢失。"""
             return memory_tool.set_active_context(content)
 
         @tool("memory_clear_active_context")
         def memory_clear_active_context() -> str:
-            """清空当前任务上下文（任务结束时用）。"""
+            """清空当前任务上下文（任务结束时使用）。"""
             return memory_tool.clear_active_context()
 
         @tool("search_web")
         def search_web(query: str, count: int = 5) -> str:
-            """使用 SerpAPI 进行网页搜索。"""
+            """网页搜索。"""
             return search_tool.run(query, count)
 
         @tool("fetch_url")
         def fetch_url(url: str) -> str:
-            """抓取网页内容并转换为可读文本。"""
+            """抓取网页内容转为可读文本。"""
             return fetch_tool.run(url)
 
         @tool("list_workspace")
         def list_workspace(path: str = ".", recursive: bool = False, max_entries: int = 200) -> str:
-            """列出工作区目录内容（受白名单目录限制）。"""
+            """列出工作区目录内容。"""
             return file_tool.list_dir(path=path, recursive=recursive, max_entries=max_entries)
 
         @tool("read_workspace_file")
         def read_workspace_file(path: str, start_line: int = 1, end_line: int = 200) -> str:
-            """读取工作区文本文件（受白名单目录限制）。"""
+            """读取工作区文件，支持行范围。"""
             return file_tool.read_text(path=path, start_line=start_line, end_line=end_line)
 
         @tool("write_workspace_file")
         def write_workspace_file(path: str, content: str, mode: str = "overwrite") -> str:
-            """写入工作区文本文件（受白名单目录限制）。"""
-            return file_tool.write_text(path=path, content=content, mode=mode)
+            """写入工作区文件（overwrite/append/create）。"""
+            result = file_tool.write_text(path=path, content=content, mode=mode)
+            if not result.startswith("写入成功"):
+                return result
+            # 写入后校验：读回前 3 行确认内容已落地
+            verify_result = file_tool.read_text(path=path, start_line=1, end_line=3)
+            if "文件不存在" in verify_result or "读取失败" in verify_result:
+                # 重试一次，保留原始 mode 避免 append 时覆盖已有内容
+                result = file_tool.write_text(path=path, content=content, mode=mode)
+                if not result.startswith("写入成功"):
+                    return f"写入校验失败，重试也失败: {result}"
+                return f"写入成功（已重试并校验通过）: {path}"
+            return result
 
         @tool("execute_command")
         def execute_command(command: str, working_directory: str = "", timeout_seconds: int = 0) -> str:
-            """在本地白名单目录执行命令（受命令白名单、超时和输出限制保护）。"""
+            """执行本地命令（受白名单和策略保护）。"""
             requested_timeout = timeout_seconds if timeout_seconds and timeout_seconds > 0 else None
             return command_tool.run(
                 command=command,
@@ -504,7 +497,7 @@ class CrabClawAgent:
 
         @tool("list_skills")
         def list_skills() -> str:
-            """列出当前已安装的所有技能（Skills）。"""
+            """列出已安装技能，返回名称和简介。"""
             skills = self._skill_registry.list_skills()
             if not skills:
                 return "当前没有安装任何技能。"
@@ -513,6 +506,23 @@ class CrabClawAgent:
                 lines.append(f"- {skill['name']}: {skill['description']}")
             return "\n".join(lines)
 
+        @tool("run_skill")
+        def run_skill(skill_name: str) -> str:
+            """激活指定技能并获取其工作指令。参数为技能名称（支持模糊匹配）。调用后按返回的指令执行任务。"""
+            normalized = self._skill_registry._sanitize_skill_id(skill_name)
+            # 尝试精确匹配
+            skill = self._skill_registry.get_skill(normalized, include_prompt=True)
+            # 尝试模糊匹配：遍历所有技能，找名称包含输入值的
+            if not skill:
+                for s in self._skill_registry.list_skills():
+                    if normalized in s["id"] or skill_name.strip() in s.get("name", ""):
+                        skill = self._skill_registry.get_skill(s["id"], include_prompt=True)
+                        break
+            if not skill:
+                available = [s["id"] for s in self._skill_registry.list_skills()]
+                return f"未找到技能「{skill_name}」。可用技能：{', '.join(available) if available else '无'}"
+            return self._build_skill_prompt(skill)
+
         @tool("datetime_query")
         def datetime_query(query: str = "") -> str:
             """查询当前日期、时间和星期。"""
@@ -520,42 +530,8 @@ class CrabClawAgent:
 
         @tool("calculator")
         def calculator(expression: str) -> str:
-            """安全计算数学表达式，支持加减乘除、幂运算、三角函数等。"""
+            """计算数学表达式（加减乘除、幂、三角函数等）。"""
             return self._calculator_tool.run(expression)
-
-        @tool("rag_search")
-        def rag_search(query: str, top_k: int = 5) -> str:
-            """搜索已索引的文档，返回语义相关的内容片段。使用前需先通过 rag_ingest 索引文档。"""
-            eidx = self.workspace._get_embedding_index()
-            if eidx is None:
-                return "RAG 不可用：请先配置 LLM API key（embedding 需要）。"
-            retriever = RagRetriever(self._rag_index_dir, eidx)
-            return retriever.search(query, top_k=top_k)
-
-        @tool("rag_list")
-        def rag_list() -> str:
-            """列出所有已索引的文档。"""
-            eidx = self.workspace._get_embedding_index()
-            if eidx is None:
-                return "RAG 不可用：请先配置 LLM API key。"
-            ingester = RagIngester(self._rag_index_dir, eidx)
-            docs = ingester.list_docs()
-            if not docs:
-                return "当前没有已索引的文档。使用 rag_ingest 上传文档。"
-            lines = ["已索引的文档："]
-            for d in docs:
-                lines.append(f"- {d['doc_id']}：{d.get('source', '?')} ({d.get('chunks', 0)} 块)")
-            return "\n".join(lines)
-
-        @tool("rag_delete")
-        def rag_delete(doc_id: str) -> str:
-            """删除已索引的文档，传入文档 ID（通过 rag_list 查看）。"""
-            eidx = self.workspace._get_embedding_index()
-            if eidx is None:
-                return "RAG 不可用。"
-            ingester = RagIngester(self._rag_index_dir, eidx)
-            ok = ingester.delete_doc(doc_id)
-            return f"已删除文档 {doc_id}" if ok else f"文档 {doc_id} 不存在"
 
         return [
             memory_search,
@@ -574,11 +550,9 @@ class CrabClawAgent:
             write_workspace_file,
             execute_command,
             list_skills,
+            run_skill,
             datetime_query,
             calculator,
-            rag_search,
-            rag_list,
-            rag_delete,
         ]
 
     def _rebuild_agent_if_needed(self) -> None:
@@ -622,39 +596,33 @@ class CrabClawAgent:
         self._init_error = None
 
     def _resolve_skill_mode(self, message: str, skill_id: str | None) -> tuple[str, Optional[dict]]:
-        raw_message = message or ""
-        matched = re.match(r"^\s*[#＃](.*)$", raw_message, flags=re.DOTALL)
-        if not matched:
-            return raw_message, None
-
         if not skill_id:
-            raise ValueError("检测到 # 技能模式，但未选择技能。")
-
-        task_message = (matched.group(1) or "").strip()
-        if not task_message:
-            raise ValueError("请输入 # 后的任务内容。")
+            return (message or ""), None
 
         skill = self._skill_registry.get_skill(skill_id, include_prompt=True)
         if not skill:
             raise ValueError(f"技能不存在: {skill_id}")
 
-        return task_message, skill
+        return (message or ""), skill
 
     @staticmethod
     def _build_skill_prompt(skill: dict) -> str:
         name = str(skill.get("name") or skill.get("id") or "Skill")
-        skill_id = str(skill.get("id") or "")
         prompt = str(skill.get("prompt") or "").strip()
         if len(prompt) > 16000:
             prompt = prompt[:16000] + "\n\n[技能内容已截断以控制上下文长度]"
 
         return (
-            f"## 本轮技能模式已启用\n"
-            f"- skill_id: {skill_id}\n"
-            f"- skill_name: {name}\n\n"
-            "请严格遵循以下技能指令处理本轮用户请求：\n"
+            f"【角色切换】你现在的角色是「{name}」。"
+            "请内化以下工作规范，然后直接用该角色的专业方式输出结果：\n\n"
             f"{prompt}\n\n"
-            "约束：这是一轮临时技能，不要把技能内容当作用户长期偏好写入记忆。"
+            "---\n"
+            "【输出硬约束 — 违反将导致本轮结果无效】\n"
+            "1. 禁止在回复中提及「技能」「角色」「指令」「切换」或技能名称等元信息。\n"
+            "2. 禁止对上述工作规范做「收到/明白/将按照」之类的确认回复。\n"
+            "3. 禁止展示内部处理过程、检查清单、中间步骤——直接给最终产物。\n"
+            "4. 禁止把上述工作规范的内容写入长期记忆。\n"
+            "5. 只输出规范要求你输出的内容，就像你天生具备这个能力一样。"
         )
 
     def _ensure_agent(self) -> None:
@@ -673,8 +641,7 @@ class CrabClawAgent:
     @staticmethod
     def _is_tool_failure_content(content: str) -> bool:
         text = (content or "").lower()
-        markers = ["error", "failed", "traceback", "失败", "超时", "未在白名单"]
-        return any(marker in text for marker in markers)
+        return any(marker in text for marker in CrabClawAgent._FAILURE_MARKERS)
 
     @staticmethod
     def _brief_tool_content(content: str, limit: int = 120) -> str:
@@ -874,11 +841,22 @@ class CrabClawAgent:
         session_data["messages"] = merged
         self.workspace.save_session_data(session_id, session_data)
 
+    _TOKENIZER: Optional[Any] = None
+
+    @classmethod
+    def _get_tokenizer(cls) -> Any:
+        if cls._TOKENIZER is None:
+            cls._TOKENIZER = tiktoken.get_encoding(cls._TOKENIZER_ENCODING)
+        return cls._TOKENIZER
+
     def _estimate_tokens(self, messages: List[dict]) -> int:
-        chars = len(self._build_system_prompt())
+        tokenizer = self._get_tokenizer()
+        if self._cached_system_prompt_tokens is None:
+            self._cached_system_prompt_tokens = len(tokenizer.encode(self._build_system_prompt(), disallowed_special=()))
+        total = self._cached_system_prompt_tokens
         for msg in messages:
-            chars += len(str(msg.get("content", "")))
-        return chars // 3
+            total += len(tokenizer.encode(str(msg.get("content", "")), disallowed_special=()))
+        return total
 
     def _runtime_config(self, session_id: str | None) -> Dict[str, Any]:
         if not session_id:
@@ -886,12 +864,17 @@ class CrabClawAgent:
         return {"configurable": {"thread_id": session_id}}
 
     def _run_memory_flush_if_needed(self, langchain_history: List[BaseMessage], session_id: str | None = None) -> None:
-        current_tokens = self._estimate_tokens([message_to_history(m) or {} for m in langchain_history])
+        history_dicts = [message_to_history(m) or {} for m in langchain_history]
+        current_tokens = self._estimate_tokens(history_dicts)
         if not self._memory_flush_manager.should_trigger_flush(current_tokens):
             return
 
         try:
+            summary_context = self._build_flush_context_summary(history_dicts)
             flush_prompt = self._memory_flush_manager.get_flush_prompt()
+            if summary_context:
+                flush_prompt = summary_context + "\n\n" + flush_prompt
+
             runtime_config = self._runtime_config(session_id)
             self._agent.invoke(
                 {"messages": langchain_history + [HumanMessage(content=flush_prompt)]},
@@ -901,18 +884,26 @@ class CrabClawAgent:
         except Exception:
             return
 
+    @staticmethod
+    def _build_flush_context_summary(history: List[dict]) -> str:
+        excerpt = SessionSummarizer._extract_excerpt(history, last_n=6)
+        if not excerpt:
+            return ""
+        return f"以下是对话早期的摘要（用于参考，无需重复保存已知信息）：\n{excerpt}"
+
     def chat(self, message: str, session_id: str | None = None, skill_id: str | None = None) -> tuple[str, str]:
+        self._workspace_file_tool.clear_read_cache()
         sid = session_id or self.create_session()
         self._current_session_id = sid
-
-        first_contact_response = self._handle_first_contact_gate(message)
-        if first_contact_response is not None:
-            return first_contact_response, sid
 
         normalized_message, selected_skill = self._resolve_skill_mode(message, skill_id)
 
         data = self.workspace.load_session_data(sid)
         history = data.get("messages", [])
+
+        # 首次初始化：注入 BOOTSTRAP.md 作为系统指令，让 Agent 自然引导
+        needs_bootstrap = self._needs_bootstrap(sid)
+        bootstrap_instruction = self._build_bootstrap_instruction() if needs_bootstrap else None
 
         language = self._resolve_output_language(normalized_message)
         timezone_name = self.workspace.get_user_timezone()
@@ -977,6 +968,8 @@ class CrabClawAgent:
         self._ensure_agent()
         base_messages = self._history_to_langchain_messages(history)
         input_messages: List[BaseMessage] = [*base_messages]
+        if bootstrap_instruction:
+            input_messages.insert(0, SystemMessage(content=bootstrap_instruction))
         if selected_skill:
             input_messages.append(SystemMessage(content=self._build_skill_prompt(selected_skill)))
         input_messages.append(HumanMessage(content=normalized_message))
@@ -1036,18 +1029,17 @@ class CrabClawAgent:
         return final_text, sid
 
     async def astream_chat(self, message: str, session_id: str | None = None, skill_id: str | None = None) -> AsyncIterator[dict]:
+        self._workspace_file_tool.clear_read_cache()
+        self._tool_failure_counts.clear()
         sid = session_id or self.create_session()
         self._current_session_id = sid
 
-        first_contact_response = self._handle_first_contact_gate(message)
-        if first_contact_response is not None:
-            yield {"event": "session", "data": {"session_id": sid}}
-            yield {"event": "chunk", "data": {"content": first_contact_response}}
-            yield {"event": "done", "data": {"content": first_contact_response, "session_id": sid}}
-            return
-
         data = self.workspace.load_session_data(sid)
         history = data.get("messages", [])
+
+        # 首次初始化：注入 BOOTSTRAP.md 作为系统指令，让 Agent 自然引导
+        needs_bootstrap = self._needs_bootstrap(sid)
+        bootstrap_instruction = self._build_bootstrap_instruction() if needs_bootstrap else None
 
         try:
             normalized_message, selected_skill = self._resolve_skill_mode(message, skill_id)
@@ -1142,6 +1134,8 @@ class CrabClawAgent:
 
         base_messages = self._history_to_langchain_messages(history)
         input_messages: List[BaseMessage] = [*base_messages]
+        if bootstrap_instruction:
+            input_messages.insert(0, SystemMessage(content=bootstrap_instruction))
         if selected_skill:
             input_messages.append(SystemMessage(content=self._build_skill_prompt(selected_skill)))
         input_messages.append(HumanMessage(content=normalized_message))
@@ -1211,14 +1205,29 @@ class CrabClawAgent:
                                 tc_id = getattr(msg, "tool_call_id", "")
                                 content = str(getattr(msg, "content", ""))
                                 failed = self._is_tool_failure_content(content)
+
+                                # Track consecutive tool failures
+                                tool_name = getattr(msg, "name", "")
+                                if tool_name:
+                                    if failed:
+                                        self._tool_failure_counts[tool_name] = self._tool_failure_counts.get(tool_name, 0) + 1
+                                    else:
+                                        self._tool_failure_counts.pop(tool_name, None)
+
+                                summary = self._brief_tool_content(content)
                                 yield {
                                     "event": "tool_end",
                                     "data": {
                                         "tool_call_id": tc_id or "",
                                         "success": not failed,
-                                        "summary": self._brief_tool_content(content),
+                                        "summary": summary,
                                     },
                                 }
+
+                                # Emit warning when same tool fails 3+ times
+                                if self._tool_failure_counts.get(tool_name, 0) >= 3:
+                                    warning = f"{tool_name} 已连续失败 {self._tool_failure_counts[tool_name]} 次，建议换用其他工具或方案。"
+                                    yield {"event": "tool_warning", "data": {"tool_name": tool_name, "message": warning}}
 
             if not full_text:
                 text_from_messages = find_final_assistant_text(final_messages)
@@ -1268,6 +1277,13 @@ class CrabClawAgent:
                     "session_id": sid,
                 },
             }
+        except asyncio.CancelledError:
+            # 客户端断连：保存已生成的部分对话，避免丢失历史
+            if generated or full_text:
+                if full_text and not any(m.get("role") == "assistant" and m.get("content") for m in generated):
+                    generated.append({"role": "assistant", "content": full_text})
+                self._append_and_save_history(sid, history, message, generated)
+            raise
         except Exception as exc:
             import logging
             logging.getLogger("crabclaw").error("Agent stream error in session %s: %s", sid, exc)

@@ -68,9 +68,12 @@
 
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import { message } from 'ant-design-vue'
 import { sessionApi, type Session } from '../api/session'
 import { useSessionStore } from '../stores/session'
+
+const router = useRouter()
 
 const store = useSessionStore()
 const sessions = ref<Session[]>([])
@@ -122,6 +125,7 @@ async function submitCreate() {
     message.success(`已创建会话 ${res.data.session_id}`)
     createOpen.value = false
     await load()
+    await router.push('/chat')
   } catch (error) {
     message.error(errorDetail(error))
   } finally {
@@ -129,9 +133,10 @@ async function submitCreate() {
   }
 }
 
-function select(id: string) {
+async function select(id: string) {
   currentSessionId.value = id
   message.success(`已切换会话 ${id}`)
+  await router.push('/chat')
 }
 
 async function remove(id: string) {
